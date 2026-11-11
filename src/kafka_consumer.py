@@ -1,4 +1,5 @@
 import sys
+import os
 import io
 import time
 import datetime
@@ -28,6 +29,7 @@ def _do_nothing( *args, **kwargs ):
 def _close_kafka_consumer( obj ):
     obj.close()
 
+_orphaned_consumers = [] 
 
 class KafkaConsumer:
     """Consume messages from a kafka server using a confluent_kafka.Consumer."""
@@ -90,6 +92,7 @@ class KafkaConsumer:
 
         self.logger = logger
         self.tot_handled = 0
+        self._owner_pid = os.getpid()
         if topics is None:
             self.topics = []
         elif isinstance( topics, str ):
@@ -126,8 +129,12 @@ class KafkaConsumer:
 
     def close( self ):
         if self.consumer is not None:
-            self.consumer.close()
+            if os.getpid() == self._owner_pid:
+                self.consumer.close()
+            else:
+                _orphaned_consumers.append( self.consumer )   # forked copy; never touch it
             self.consumer = None
+
 
     def __del__( self ):
         self.close()
