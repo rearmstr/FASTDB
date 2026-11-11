@@ -25,7 +25,7 @@ import db
 from kafka_consumer import KafkaConsumer
 
 # Default location of BrokerMessage schema
-_default_brokermessage_schemafile = "/fastdb/share/avsc/fastdb.v10_0_0.BrokerMessage.avsc"
+_default_brokermessage_schemafile = "/fastdb/share/avsc/fastdb.v11_1_0.BrokerMessage.avsc"
 
 from concurrent.futures import ThreadPoolExecutor  # for pittgoogle
 import pittgoogle
@@ -474,6 +474,10 @@ class BrokerConsumer:
 
     @classmethod
     def _wrangle_object( cls, msg, metamsg ):
+        # Throw out things with diaObjectId 0; those are bad
+        if msg['diaSource']['diaObjectId'] in [0, None]:
+            return None
+
         obj = { 'diaobjectid': msg['diaSource']['diaObjectId'],
                 'savetime': metamsg['savetime'],
                 'diaobjectposition': None }
@@ -530,13 +534,14 @@ class BrokerConsumer:
     def _wrangle_all_standard_lsst_fields( self, metamsg, msg ):
         obj = self._wrangle_object( msg, metamsg )
         # Basic sanity check
-        try:
-            np.int64( obj['diaobjectid'] )
-        except Exception as ex:
-            self.countlogger.error( f"Got an alert with diaSource.diaObjectId={obj['diaobjectid']} "
-                                    f"(type {type(obj['diaobjectid'])}), which isn't "
-                                    f"a 64-bit integer.  Skipping this alert!  Exception: {ex}" )
-            return None
+        if obj is not None:
+            try:
+                np.int64( obj['diaobjectid'] )
+            except Exception as ex:
+                self.countlogger.error( f"Got an alert with diaSource.diaObjectId={obj['diaobjectid']} "
+                                        f"(type {type(obj['diaobjectid'])}), which isn't "
+                                        f"a 64-bit integer.  Skipping this alert!  Exception: {ex}" )
+                return None
 
         # TODO : more sanity checks.
 
@@ -559,6 +564,7 @@ class BrokerConsumer:
 
         if any( ( f in msg and f is not None ) for f in [ 'cutoutDifference', 'cutoutScience', 'cutoutTemplate' ] ):
             thumbnails = { 'diasourceid': msg['diaSource']['diaSourceId'],
+                           'diaobjectid': msg['diaSource']['diaObjectId'],
                            'savetime': metamsg['savetime'] }
             thumbnails.update( { f.lower(): msg[f] if f in msg else None
                                  for f in ['cutoutDifference', 'cutoutScience', 'cutoutTemplate' ] } )
@@ -1057,7 +1063,7 @@ class PittGoogleConsumer(BrokerConsumer):
     Known topic names:
        'alerts' : full lsst alert stream
        'loop' : the same alert repeated every second, for testing
-       'supernnoa'
+       'supernnova'
        'upsilon'
        'variability'
 
@@ -1071,6 +1077,7 @@ class PittGoogleConsumer(BrokerConsumer):
         groupid: str = "default_pittgooglebroker_fastdb_groupid",
         survey: str = "lsst",
         topic_name: str = None,
+        alert_format: str = "avro",
         testid: bool | str = False,
         max_workers: int = 8,  # max number of ThreadPoolExecutor workers
         loggername: str = "PITTGOOGLE",
@@ -1096,8 +1103,12 @@ class PittGoogleConsumer(BrokerConsumer):
             ):
             raise ValueError( "Need to set env vars GOOGLE_CLOUD_PROJECT and GOOGLE_APPLICATION_CREDENTIALS" )
 
+        if alert_format not in ( "json", "avro" ):
+            raise ValueError( f"Unknown alert_format {alert_format}, must be json or avro" )
+
         self._survey = survey
         self._name = topic_name
+        self._alert_format = alert_format
         self._testid = testid
         self._max_workers = max_workers
         self._groupid = groupid
@@ -1112,9 +1123,14 @@ class PittGoogleConsumer(BrokerConsumer):
 
         self.logger.debug( "In handle_message" )
 
-        # NOTE -- start reading alert.msg.data at byte 5 because the first 4 bytes
-        #   are a schema ID of some sort.
-        parsedalert = fastavro.schemaless_reader(io.BytesIO(alert.msg.data[5:]), self.schema)
+        if self._alert_format == "avro":
+            # NOTE -- start reading alert.msg.data at byte 5 because the first 4 bytes
+            #   are a schema ID of some sort.
+            parsedalert = fastavro.schemaless_reader(io.BytesIO(alert.msg.data[5:]), self.schema)
+        elif self._aert_format == "json":
+            parsedalert = simplejson.loads( alert.msg.data.decode('utf-8') )
+        else:
+            raise RuntimeError( "This should never happen." )
 
         if self.brokername_for_alerts is not None:
             bname = self.brokername_for_alerts
@@ -1164,7 +1180,7 @@ class PittGoogleConsumer(BrokerConsumer):
         if len(kwargs) > 0:
             raise RuntimeError( f"Parameters unknown to PittGoogleConsumer.poll: {list(kwargs.keys())}" )
         if reset is not None:
-            self.logger.warning( "reset is not known by PittGoogleConsumer.poll, ignorig it" )
+            self.logger.warning( "reset is not known by PittGoogleConsumer.poll, ignoring it" )
 
         currenttotconsumed = 0
         restarts = 0
@@ -1207,7 +1223,9 @@ class PittGoogleConsumer(BrokerConsumer):
                 self.countlogger.info( f"Launching a pittgoogle stream, topic={self.topic}..." )
 
                 result = self.consumer.stream( pipe=self.pipe, heartbeat=60,
-                                                  max_runtime=restart_time, max_nmsgs=max_msgs )
+                                               max_runtime=restart_time, max_nmsgs=max_msgs,
+                                               exception_on_no_callback=True
+                                              )
                 currenttotconsumed += result['totprocessed']
                 self.countlogger.info( f"...pittgoogle stream consumed {result['totprocessed']} messages; "
                                        f"this call to poll consumed {currenttotconsumed} messages, "

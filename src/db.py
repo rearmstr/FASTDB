@@ -7,6 +7,7 @@
 
 # import sys
 import os
+import re
 import uuid
 import time
 import collections
@@ -23,7 +24,7 @@ import psycopg.types.json
 import pymongo
 
 import util
-from util import FDBLogger
+from util import FDBLogger, asUUID
 
 # These next three are for debugging, as sometimes it's very useful to
 # see the actual queries being sent to the database, and to see what
@@ -59,11 +60,11 @@ all_table_names = [ 'query_queue',
                     'spectruminfo', 'plannedspectra', 'wantedspectra',
                     'ppdb_alerts_sent', 'ppdb_diaforcedsource', 'ppdb_diasource', 'ppdb_diaobject', 'ppdb_host_galaxy',
                     'diaforcedsource_extra', 'diaforcedsource', 'diasource_brokerinfo', 'diasource_extra', 'diasource',
-                    'diaobject_host_match', 'diaobject_position', 'diaobject', 'root_diaobject', 'host_galaxy',
-                    'diasource_import_time',
+                    'diaobject_host_match', 'diaobject_position', 'diaobject', 'root_diaobject_tag', 'root_diaobject',
+                    'host_galaxy', 'diasource_import_time', 'tags',
                     'processing_version_alias', 'base_procver_of_procver',
                     'processing_version', 'base_processing_version',
-                    'passwordlink', 'authuser',
+                    'passwordlink', 'auth_user_group', 'authgroup', 'authuser',
                     'migrations_applied' ]
 
 # ======================================================================
@@ -159,7 +160,7 @@ class DBCon:
 
     """
 
-    def __init__( self, con=None, dictcursor=False ):
+    def __init__( self, con=None, dictcursor=False, echoqueries=None, alwaysexplain=None, alwaysanalyze=None ):
         """Instantiate.
 
         If you use this, you should also use close(), and soon.
@@ -182,6 +183,15 @@ class DBCon:
             If False, then execute returns two lists: a list of tuples
             (the rows) and a list of strings (the column names).
 
+          echoqueries, alwaysexplain, alwaysanaylze : bool, default None
+            If any of these are None, they are inhertied from con if con
+            is a DBCon, otherwise they are inherited from the global
+            values of _echoqueries, _alwaysexplain, and _alwaysanalyze
+            defined in this module.  Set the default values for echo and
+            explain to calls to this DBCon's execute method, and for
+            echo, explain, and analyze to calls to this DBCon's
+            execute_nofetch method.
+
         """
 
         global dbuser, dbpasswd, dbhost, dbport, dbname
@@ -193,15 +203,15 @@ class DBCon:
             if isinstance( con, DBCon ):
                 self.con = con.con
                 self.timings = con.timings
-                self.echoqueries = con.echoqueries
-                self.alwaysexplain = con.alwaysexplain
-                self.alwaysanalyze = con.alwaysanalyze
+                self.echoqueries = echoqueries if echoqueries is not None else con.echoqueries
+                self.alwaysexplain = alwaysexplain if alwaysexplain is not None else con.alwaysexplain
+                self.alwaysanalyze = alwaysanalyze if alwaysanalyze is not None else con.alwaysanalyze
             elif isinstance( con, psycopg.Connection ):
                 self.con = con
                 self.timings = DBConTimings()
-                self.echoqueries = _echoqueries
-                self.alwaysexplain = _alwaysexplain
-                self.alwaysanalyze = _alwaysanalyze
+                self.echoqueries = echoqueries if echoqueries is not None else _echoqueries
+                self.alwaysexplain = alwaysexplain if alwaysexplain is not None else _alwaysexplain
+                self.alwaysanalyze = alwaysanalyze if alwaysanalyze is not None else _alwaysanalyze
             else:
                 raise TypeError( f"con must be None, a DBCon, or a psycopg.Connection, not a {type(con)}" )
             self._con_is_mine = False
@@ -209,11 +219,12 @@ class DBCon:
             self.con = psycopg.connect( dbname=dbname, user=dbuser, password=dbpasswd, host=dbhost, port=dbport )
             self._con_is_mine = True
             self.timings = DBConTimings()
-            self.echoqueries = _echoqueries
-            self.alwaysexplain = _alwaysexplain
-            self.alwaysanalyze = _alwaysanalyze
+            self.echoqueries = echoqueries if echoqueries is not None else _echoqueries
+            self.alwaysexplain = alwaysexplain if alwaysexplain is not None else _alwaysexplain
+            self.alwaysanalyze = alwaysanalyze if alwaysanalyze is not None else _alwaysanalyze
 
         self.dictcursor = dictcursor
+        self.cursor = None
         self.remake_cursor()
 
 
@@ -249,6 +260,8 @@ class DBCon:
             names).
 
         """
+        if self.cursor is not None:
+            self.cursor.close()
         self.curcursorisdict = self.dictcursor if dictcursor is None else dictcursor
         if self.curcursorisdict:
             self.cursor = self.con.cursor( row_factory=psycopg.rows.dict_row )
@@ -267,6 +280,8 @@ class DBCon:
 
         """
         if self._con_is_mine:
+            if self.cursor is not None:
+                self.cursor.close()
             self.con.rollback()
             self.con.close()
 
@@ -295,12 +310,59 @@ class DBCon:
         self.remake_cursor( self.curcursorisdict )  # ...is this necessary?
 
 
-    def execute_nofetch( self, q, subdict={}, echo=None, explain=None, analyze=None ):
+    def execute_nofetch( self, q, subdict={}, echo=None, explain=None, analyze=None, cursorname=None ):
         """Runs a query where you don't expect to fetch results.
 
-        Parameters are the same as execute().  Returns nothing.
+        Parameters are the same as execute(), except:
+
+        cursorname : str, default None
+          If not None, then make server-side cursor of the given name
+          for this query.  This will only work on SELECT queries.  Worry
+          about postgres cursor namespace.
+
+        Returns
+        -------
+          psycopg.ClientCursor or psycopg.ServerCursor
+            A sever cursor if cursorname is not None.  If cursorname is
+            None, it just returns self.cursor.
+
+            IMPORTANT : if you get back a ServerCursor, make sure to
+            call close() on it!  Do NOT do this if you are getting back
+            self.cursor.
+
+          echo, explain: bool, default None
+            Same as echo and explain passed to DBCon.execute().
+
+          analyze: bool, default None
+            If True, run the query with EXPLAIN ANALYZE, and send the
+            output to debug logging.  If False, don't.  if None, use the
+            value set by the alwaysanalyze parmeter passed to the DBCon
+            constructor.
+
+            If explain is False, and analyze is None, analyze will be
+            set to False even if the default would have otherwise been
+            True.  (The reason for this is so that if you've set explain
+            and analyze as defaults, but you want to pass a query without
+            either, you just have to say "explain=False".)
 
         """
+
+        _curcursor = None
+
+        def _cursor():
+            nonlocal _curcursor, cursorname
+
+            if cursorname is None:
+                _curcursor = self.cursor
+                return self.cursor
+            else:
+                if _curcursor is not None:
+                    _curcursor.close()
+                if self.curcursorisdict:
+                    _curcursor = self.con.cursor( cursorname, row_factory=psycopg.rows.dict_row )
+                else:
+                    _curcursor = self.con.cursor( cursorname )
+                return _curcursor
 
         t0 = time.perf_counter()
 
@@ -308,25 +370,33 @@ class DBCon:
         if not isinstance( q, ( sql.SQL, sql.Composed ) ):
             q = sql.SQL( q )
 
+        # ...should this be >=, not <=?  THINK.
         if FDBLogger.instance().get().level <= logging.DEBUG:
             echo = echo if echo is not None else self.echoqueries
+            analyze = False if explain is False else analyze if analyze is not None else self.alwaysanalyze
             explain = explain if explain is not None else self.alwaysexplain
-            analyze = analyze if analyze is not None else self.alwaysanalyze
             if echo:
                 FDBLogger.debug( f"Sending query\n{q.as_string()}\nwith substitutions: {subdict}" )
+
+            if ( cursorname is not None ) and ( ( explain is not None ) or ( analyze is not None ) ):
+                # I haven't fully figured this out, but sometimes the server-side cursor seems
+                #   to have trouble when you try to explain
+                FDBLogger.warning( "Turning off EXPLAIN and ANALYZE for server-side cursor." )
+                explain = False
+                analyze= False
 
             nl = '\n'
             if explain:
                 FDBLogger.debug( "Explaining..." )
-                self.cursor.execute( sql.SQL("EXPLAIN ") + q, subdict )
-                rows = self.cursor.fetchall()
+                _cursor().execute( sql.SQL("EXPLAIN ") + q, subdict )
+                rows = _curcursor.fetchall()
                 dex = 'QUERY PLAN' if self.curcursorisdict else 0
                 FDBLogger.debug( f"Query plan:\n{nl.join([r[dex] for r in rows])}" )
             if analyze:
                 FDBLogger.debug( "Doing EXPLAIN ANALYZE..." )
-                self.cursor.execute( sql.SQL("EXPLAIN ANALYZE ") + q, subdict )
+                _cursor().execute( sql.SQL("EXPLAIN ANALYZE ") + q, subdict )
                 alreadydid = True
-                rows = self.cursor.fetchall()
+                rows = _curcursor.fetchall()
                 dex = 'QUERY PLAN' if self.curcursorisdict else 0
                 FDBLogger.debug( f"Query plan:\n{nl.join([r[dex] for r in rows])}" )
 
@@ -335,7 +405,7 @@ class DBCon:
         # be false, because you can't EXPLAIN ANALYZE the query and get the results
         # all in one call.
         if not alreadydid:
-            self.cursor.execute( q, subdict )
+            _cursor().execute( q, subdict )
 
         if ( FDBLogger.instance().get().level <= logging.DEBUG ) and ( echo or explain ):
             FDBLogger.debug( "Query complete." )
@@ -343,6 +413,9 @@ class DBCon:
         t1 = time.perf_counter()
         self.timings.last_query_time = t1 - t0
         self.timings.tot_query_time += t1 - t0
+
+        return _curcursor
+
 
     def execute( self, q, subdict={}, silent=False, echo=None, explain=None ):
         """Runs a query, and returns either (rows, columns) or just rows.
@@ -362,18 +435,26 @@ class DBCon:
 
           echo : bool, default None
             If True, echo queries before sending them.  If False, don't.
-            If None, use the default (self.echoqueries, initialized from
-            the _echoqueries variable at the top of this module).
+            If None, use value set by the echoqueries parameter passed
+            to the DBCon constructor.
 
           explain : bool, default None
             If True, before running the query run an EXPLAIN on it and
             send the output to debug logging.  If False, don't.  If
-            None, use the default (self.alwaysexplain, initialized from
-            the _alwaysexplain variable at the top of this module).
+            None, use the value set by the alwaysexplain parameter
+            passed to the DBCon constructor.
 
             WARNING: use of this makes you susceptible to SQL injection
             attacks if you aren't completely and totally confident about
             where your SQL came from.  Do not get bobby tablesed!
+
+            (Note that execute has no way of doing EXPLAIN ANALYZE, because
+            to get both the output of that and the output of a query with
+            returns, you'd have to run the query *twice*.  That raises
+            various issues about queries with side effects, etc., so
+            we just dodge the issue but not allowing it.  If you need to
+            EXPLAIN ANALYZE a query, use execute_nofetch.)
+
 
         Returns
         -------
@@ -385,6 +466,8 @@ class DBCon:
 
         """
         self.execute_nofetch( q, subdict, echo=echo, explain=explain, analyze=False )
+        if echo:
+            FDBLogger.debug( "Query done, fetching" )
         if self.curcursorisdict:
             if self.cursor.description is None:
                 return None
@@ -409,6 +492,9 @@ class DBCon:
 
 # ======================================================================
 
+_pgwherere = re.compile( '^(.+)_minus_(.+)_(min|max)$' )
+
+
 def construct_pgsql_where_clause( searchspec, where="WHERE", **kwargs ):
     # See spectrum.py::get_spectrum_info for an exmple
 
@@ -420,16 +506,16 @@ def construct_pgsql_where_clause( searchspec, where="WHERE", **kwargs ):
             if util.isSequence( kwargs[field] ):
                 if not fieldinfo[ 'mult' ]:
                     raise ValueError( f"Field {field} can't be a list" )
-                q += sql.SQL( "{where} {field}=ANY(%({sfield})s)" ).format( where=sql.SQL(where),
-                                                                            field=sql.Identifier(field),
-                                                                            sfield=sql.SQL(field) )
+                q += sql.SQL( "{where} {field}=ANY(%({sfield})s)\n" ).format( where=sql.SQL(where),
+                                                                              field=sql.Identifier(field),
+                                                                              sfield=sql.SQL(field) )
                 subdict[field] = list( kwargs[field] )
             else:
-                q += sql.SQL( "{where} {field}=%({sfield})s" ).format( where=sql.SQL(where),
-                                                                       field=sql.Identifier(field),
-                                                                       sfield=sql.SQL(field) )
+                q += sql.SQL( "{where} {field}=%({sfield})s\n" ).format( where=sql.SQL(where),
+                                                                         field=sql.Identifier(field),
+                                                                         sfield=sql.SQL(field) )
                 subdict[field] = kwargs[field]
-            where = " AND"
+            where = "  AND"
             del kwargs[field]
 
         if f'{field}_contains' in kwargs:
@@ -448,39 +534,79 @@ def construct_pgsql_where_clause( searchspec, where="WHERE", **kwargs ):
                                     sfield=sql.SQL(field),
                                     i=sql.SQL(str(i)) ) )
                     subdict[f'{field}_contains_{i}'] = f'%{val}%'
-                q += sql.SQL( ")" )
-                where = " AND"
+                q += sql.SQL( ")\n" )
+                where = "  AND"
             else:
-                q += sql.SQL( "{where} {field} LIKE %({sfield}_contains)s" ).format( where=sql.SQL(where),
-                                                                                           field=sql.Identifier(field),
-                                                                                           sfield=sql.SQL(field) )
+                q += sql.SQL( "{where} {field} LIKE %({sfield}_contains)s\n" ).format( where=sql.SQL(where),
+                                                                                       field=sql.Identifier(field),
+                                                                                       sfield=sql.SQL(field) )
                 subdict[f'{field}_contains'] = f"%{kwargs[f'{field}_contains']}%"
-                where = " AND"
+                where = "  AND"
             del kwargs[f'{field}_contains']
 
         if f'{field}_min' in kwargs:
             if not fieldinfo['minmax']:
                 raise ValueError( f'Field {field} doesn\'t work with "min"' )
-            if util.isSequence( f'{field}_max' ):
+            if util.isSequence( kwargs[f'{field}_min'] ):
                 raise ValueError( f"{field}_max can't be a list" )
-            q += sql.SQL( "{where} {field}>=%({sfield}_min)s" ).format( where=sql.SQL(where),
-                                                                        field=sql.Identifier(field),
-                                                                        sfield=sql.SQL(field) )
-            subdict['f{field}_min'] = kwargs[f'{field}_min']
+            q += sql.SQL( "{where} {field}>=%({sfield}_min)s\n" ).format( where=sql.SQL(where),
+                                                                          field=sql.Identifier(field),
+                                                                          sfield=sql.SQL(field) )
+            subdict[f'{field}_min'] = kwargs[f'{field}_min']
+            where = "  AND"
             del kwargs[f'{field}_min']
 
         if f'{field}_max' in kwargs:
             if not fieldinfo['minmax']:
                 raise ValueError( f'Field {field} doesn\'t work with "max"' )
-            if util.isSequence( f'{field}_max' ):
+            if util.isSequence( kwargs[f'{field}_max'] ):
                 raise ValueError( f"{field}_max can't be a list" )
-            q += sql.SQL( "{where} {field}<=%({sfield}_max)s" ).format( where=sql.SQL(where),
-                                                                        field=sql.Identifier(field) )
+            q += sql.SQL( "{where} {field}<=%({sfield}_max)s\n" ).format( where=sql.SQL(where),
+                                                                          field=sql.Identifier(field),
+                                                                          sfield=sql.SQL(field) )
             subdict[f'{field}_max'] = kwargs[f'{field}_max']
-            where = " AND"
+            where = "  AND"
             del kwargs[f'{field}_max']
 
-    return q, subdict, set(kwargs.keys())
+    # Differences
+    # NOTE.  The parsing here will screw up if any of the fields have an underscore in their
+    #   name.  Think about this.
+
+    yanks = set()
+    for kw in kwargs:
+        mat = _pgwherere.search( kw )
+        if mat is None:
+            continue
+        field = mat.group(1)
+        other = mat.group(2)
+        minmax = mat.group(3)
+
+        if not ( ( field in searchspec ) and ( other in searchspec ) ):
+            continue
+
+        if not searchspec[field]['minmax']:
+            raise ValueError( f'Field {field} doesn\'t work with "minus"' )
+        if not searchspec[other]['minmax']:
+            raise ValueError( f'Field {other} doesn\'t work with "minus"' )
+
+        if util.isSequence( kwargs[kw] ):
+            raise ValueError( f"{kw} can't be a list" )
+
+        lege = ">=" if minmax == "min" else "<="
+
+        q += sql.SQL( "{where} {field}-{other}{op}%({kw})s\n" ).format( where=sql.SQL(where),
+                                                                        field=sql.Identifier(field),
+                                                                        other=sql.Identifier(other),
+                                                                        op=sql.SQL(lege),
+                                                                        kw=sql.SQL(kw) )
+        subdict[kw] = kwargs[kw]
+        where = "  AND"
+        yanks.add( kw )
+
+    for yank in yanks:
+        del kwargs[yank]
+
+    return q, subdict, set(kwargs.keys()), where
 
 
 # ======================================================================
@@ -869,6 +995,10 @@ class DBBase:
                 raise ValueError( "Can only pass column values as named arguments "
                                   "if cols and vals are both None" )
         else:
+            # Note: as of Python 3.7, dictionaries are supposed to maintain
+            #   insertion order.  Relevant here is that there's no need to
+            #   worry that the values() call after the keys() call won't
+            #   return things in the right order.
             cols = kwargs.keys()
             vals = kwargs.values()
 
@@ -1311,7 +1441,7 @@ class DBBase:
 
     @classmethod
     def bulk_insert_or_upsert( cls, data, upsert=False, assume_no_conflict=False,
-                               dbcon=None, nocommit=False ):
+                               dbcon=None, nocommit=False, execute_even_if_nocommit=False ):
         """Try to efficiently insert a bunch of data into the database.
 
         ROB TODO DOCUMENT QUIRKS
@@ -1354,6 +1484,12 @@ class DBBase:
              which case it's the caller's responsibility to do that copy
              and commit to the database.
 
+           execute_even_if_nocommit: bool, default False
+             ....but maybe you want to do the copy, and not the commit,
+             for some reason (like a test), so set this to True in
+             that case.  If you're using this, you better really know
+             what you're doing.
+
         Returns
         -------
            int OR string
@@ -1369,7 +1505,7 @@ class DBBase:
             return
 
         if isinstance( data, list ) and isinstance( data[0], dict ):
-            columns = data[0].keys()
+            columns = list( data[0].keys() )
             # Alas, psycopg's copy seems to index the thing it's passed,
             #   so we can't just pass it d.values()
             values = [ list( d.values() ) for d in data ]
@@ -1384,7 +1520,7 @@ class DBBase:
             #   want to use database defaults are going to be
             #   the same in every object.
             sd0 = data[0]._build_subdict()
-            columns = sd0.keys()
+            columns = list( sd0.keys() )
             data = [ d._build_subdict( columns=columns ) for d in data ]
             # Alas, psycopg's copy seems to index the thing it's passed,
             #   so we can't just pass it d.values()
@@ -1393,32 +1529,41 @@ class DBBase:
             raise TypeError( f"Invalid type for data: {type(data)}" )
 
         with DBCon( dbcon ) as con:
+            sql_columns = sql.SQL( "," ).join( sql.Identifier(c) for c in columns )
             con.execute_nofetch( "DROP TABLE IF EXISTS temp_bulk_upsert", explain=False, analyze=False )
             con.execute_nofetch( f"CREATE TEMP TABLE temp_bulk_upsert (LIKE {cls.__tablename__} INCLUDING DEFAULTS)",
                                  explain=False, analyze=False )
-            with con.cursor.copy( f"COPY temp_bulk_upsert({','.join(columns)}) FROM STDIN" ) as copier:
+            q = sql.SQL( "COPY temp_bulk_upsert({cols}) FROM STDIN" ).format( cols=sql_columns )
+            with con.cursor.copy( q ) as copier:
                 for v in values:
                     copier.write_row( v )
 
             if not assume_no_conflict:
                 if not upsert:
-                    conflict = "ON CONFLICT DO NOTHING"
+                    conflict = sql.SQL( "ON CONFLICT DO NOTHING" )
                 else:
-                    conflict = ( f"ON CONFLICT ({','.join(cls._pk)}) DO UPDATE SET "
-                                 + ",".join( f"{c}=EXCLUDED.{c}" for c in columns ) )
+                    conflict = sql.SQL( "ON CONFLICT({pks}) DO UPDATE SET {colclause}"
+                                       ).format( pks=sql.SQL(",").join( sql.Identifier(k) for k in cls._pk ),
+                                                 colclause=sql.SQL(",").join(
+                                                     sql.SQL( "{x}=EXCLUDED.{x}" ).format( x=sql.Identifier(c) )
+                                                     for c in columns ) )
+                    # conflict = ( f"ON CONFLICT ({','.join(cls._pk)}) DO UPDATE SET "
+                    #              + ",".join( f"{c}=EXCLUDED.{c}" for c in columns ) )
             else:
-                conflict = ""
+                conflict = sql.SQL( "" )
 
-            q = f"INSERT INTO {cls.__tablename__} SELECT * FROM temp_bulk_upsert {conflict}"
+            q = sql.SQL( "INSERT INTO {tab}({cols}) SELECT {cols} FROM temp_bulk_upsert {conflict}"
+                        ).format( tab=sql.Identifier(cls.__tablename__), cols=sql_columns, conflict=conflict )
 
-            if nocommit:
-                return q
-            else:
+            if ( not nocommit ) or ( execute_even_if_nocommit ):
                 con.execute_nofetch( q, explain=False, analyze=False )
                 ninserted = con.cursor.rowcount
                 con.execute_nofetch( "DROP TABLE temp_bulk_upsert", explain=False, analyze=False )
-                con.commit()
+                if not nocommit:
+                    con.commit()
                 return ninserted
+            else:
+                return q
 
 
 # ======================================================================
@@ -1430,6 +1575,62 @@ class AuthUser( DBBase ):
 
     def __init__( self, *args, **kwargs ):
         super().__init__( *args, **kwargs )
+
+    usernamere = re.compile( r'^[a-zA-Z0-9_\.]+$' )
+    displaynamere = re.compile( r'^[\w_, \.]+$' )
+    emailre = re.compile( r'^[a-zA-Z0-9_\-\.]+\@[a-zA-Z0-9\-\.]+$' )
+
+    @classmethod
+    def create( cls, userid, username, displayname, email, groups=['users'], dbcon=None,
+                no_duplicate_displayname=True ):
+        userid = asUUID( userid )
+        username = username.strip()
+        displayname = displayname.strip()
+        email = email.strip()
+
+        if not AuthUser.usernamere.search( username ):
+            raise ValueError( "Invalid username, can only include a-z, A-Z, 0-9, _, and ." )
+        if not AuthUser.displaynamere.search( displayname ):
+            raise ValueError( "Invalid displayname, can only include letters, 0-9, _, space, , and ." )
+        if not AuthUser.emailre.search( email ):
+            raise ValueError( "Invalid email, can only include a-z, A-Z, 0-9, _, -, and ." )
+
+        with DBCon( dbcon ) as dbcon:
+            rows, _cols = dbcon.execute(
+                sql.SQL( "SELECT username, email, displayname FROM authuser "
+                         "WHERE username={user} OR email={email} OR displayname={displayname}" )
+                .format( user=username, email=email, displayname=displayname ) )
+            for row in rows:
+                if row[0] == username:
+                    raise ValueError( f"username {username} already exists" )
+                if row[1] == email:
+                    raise ValueError( f"email {email} already exists" )
+                if row[2] == displayname:
+                    if no_duplicate_displayname:
+                        raise ValueError( f"displayname {displayname} already exists" )
+                    else:
+                        FDBLogger.warning( f"displayname {displayname} already exists, but "
+                                           f"no_duplicate_displayname is False, so proceeding." )
+
+            rows, _cols = dbcon.execute(
+                sql.SQL( "SELECT id, name FROM authgroup WHERE name=ANY(ARRAY[{groups}])"
+                        ).format( groups=sql.SQL(",").join( groups ) ) )
+            knowngroups = set( r[1] for r in rows )
+            if set( groups ) != set( r[1] for r in rows ):
+                raise ValueError( f"Unknown groups: {groups - knowngroups}" )
+            groupids = [ r[0] for r in rows ]
+
+            dbcon.execute( sql.SQL( "INSERT INTO authuser(id, username, displayname, email) "
+                                    "VALUES ({userid}, {username}, {displayname}, {email})" )
+                           .format( userid=userid, username=username, displayname=displayname, email=email ) )
+            for gid in groupids:
+                dbcon.execute( sql.SQL( "INSERT INTO auth_user_group(userid, groupid) "
+                                        "VALUES ({userid}, {groupid})" )
+                               .format( userid=userid, groupid=gid ) )
+
+            dbcon.commit()
+
+            return AuthUser( id=userid, username=username, displayname=displayname, email=email )
 
 
 # ======================================================================
@@ -1499,6 +1700,43 @@ class ProcessingVersion( DBBase ):
     _tablemeta = None
     _pk = [ 'id' ]
 
+
+    @classmethod
+    def get_procver( cls, processing_version, dbcon=None ):
+        """Return a ProcessingVersion based on a UUID, description, or alias."""
+
+        try:
+            pvid = util.asUUID( processing_version )
+        except Exception:
+            pvid = None
+
+        with DBCon( dbcon, dictcursor=True ) as con:
+            if pvid is not None:
+                rows = con.execute( "SELECT * FROM processing_version WHERE id=%(pv)s", { 'pv': pvid } )
+                if len(rows) > 0:
+                    if len(rows) > 1:
+                        raise RuntimeError( "This should never happen." )
+                    return ProcessingVersion( **(rows[0]) )
+
+            rows = con.execute( "SELECT * FROM processing_version WHERE description=%(pv)s",
+                                { 'pv': processing_version } )
+            if len(rows) > 0:
+                if len(rows) > 1:
+                    raise RuntimeError( "This should never happen." )
+                return ProcessingVersion( **(rows[0]) )
+
+            rows = con.execute( "SELECT p.* FROM processing_version p "
+                                "INNER JOIN processing_version_alias a ON p.id=a.procver_id "
+                                "WHERE a.description=%(pv)s",
+                                { 'pv': processing_version } )
+            if len(rows) > 0:
+                if len(rows ) > 1:
+                    raise RuntimeError( "This should never happen." )
+                return ProcessingVersion( **(rows[0]) )
+
+        raise ValueError( f"Unknown processing version {processing_version}" )
+
+
     @classmethod
     def procver_id( cls, processing_version, dbcon=None ):
         """Return the uuid of processing_version.
@@ -1533,16 +1771,9 @@ class ProcessingVersion( DBBase ):
             return ipv
         except Exception:
             pass
-        with DBCon( dbcon ) as con:
-            rows, _cols = con.execute( "SELECT id FROM processing_version WHERE description=%(pv)s",
-                                       { 'pv': processing_version } )
-            if len(rows) > 0:
-                return rows[0][0]
-            rows, _cols = con.execute( "SELECT procver_id FROM processing_version_alias WHERE description=%(pv)s",
-                                       { 'pv': processing_version } )
-            if len(rows) == 0:
-                raise ValueError( f"Unknown processing version {processing_version}" )
-            return rows[0][0]
+
+        pv = cls.get_procver( processing_version, dbcon=dbcon )
+        return pv.id
 
 
     def highest_prio_base_procver( self, table, dbcon=None ):
@@ -1613,10 +1844,69 @@ class ProcessingVersionAlias( DBBase ):
 
 # ======================================================================
 
+class Tag( DBBase ):
+    __tablename__ = "tags"
+    _tablemeta = None
+    _pk = [ 'id' ]
+
+    # Allow getting by id or tag
+    @classmethod
+    def get( cls, tag, dbcon=None ):
+        with DBCon() as dbcon:
+            try:
+                tagid = asUUID( tag )
+                q = sql.SQL( "SELECT * FROM tags WHERE id={tagid}" ).format( tagid=tagid )
+            except Exception:
+                q = sql.SQL( "SELECT * FROM tags WHERE tag={tag}" ).format( tag=tag )
+
+            rows, cols = dbcon.execute( q )
+            if len(rows) > 1:
+                raise RuntimeError( f"Database corruption: muiltiple tags {tag}.  This shouldn't happen" )
+            elif len(rows) == 0:
+                return None
+            else:
+                return Tag( dbcon, cols=cols, vals=rows[0] )
+
+
+# ======================================================================
+
 class RootDiaObject( DBBase ):
     __tablename__ = "root_diaobject"
     _tablemeta = None
     _pk = [ 'id' ]
+
+    # Allow getting by either rootid or diaobjectid, since diaobjectids are supposed to
+    #   be unique (although there will be possibly multiple diaobjectids for the same rootid)
+    @classmethod
+    def get( cls, objid, dbcon=None ):
+        with DBCon() as dbcon:
+            try:
+                rootid = asUUID( objid )
+                q = sql.SQL( "SELECT * FROM root_diaobject WHERE id={rootid}" ).format( rootid=rootid )
+            except Exception:
+                try:
+                    tmp = int(objid)
+                    objid = tmp
+                except Exception:
+                    raise ValueError( f"Invalid object id / root id {objid}" )
+                q = sql.SQL( "SELECT r.* FROM root_diaobject r "
+                             "INNER JOIN diaobject o ON o.rootid=r.id "
+                             "WHERE o.diaobjectid={objid}" ).format( objid=objid )
+            rows, cols = dbcon.execute( q )
+            if len(rows) > 1:
+                raise RuntimeError( f"Database corruption; multiple objects {objid}.  This shouldn't happen." )
+            elif len(rows) == 0:
+                return None
+            else:
+                return RootDiaObject( dbcon, cols=cols, vals=rows[0] )
+
+
+# ======================================================================
+
+class RootDiaObjectTag( DBBase ):
+    __tablename__ = "root_diaobject_tag"
+    _tablemeta = None
+    _pk = [ 'rootid', 'tagid' ]
 
 
 # ======================================================================
@@ -1667,7 +1957,7 @@ class DiaSourceExtra( DBBase ):
     _pk = [ 'diasourceid', 'base_procver_id' ]
 
     # This is a mapping of the bit in the flags field
-    #   to the boolean in the lsst v10 alert
+    #   to the boolean in the lsst v11.1 alert
     _flags_bits = { 0x00000001: 'centroid_flag',
                     0x00000002: 'apFlux_flag',
                     0x00000004: 'apFlux_flag_apertureTruncated',
@@ -1684,12 +1974,13 @@ class DiaSourceExtra( DBBase ):
                     0x00002000: 'shape_flag_not_contained',
                     0x00004000: 'shape_flag_parent_source',
                     0x00008000: 'isDipole',
-                    0x00010000: 'dipleFitAttempted',
+                    0x00010000: 'dipoleFitAttempted',
                     0x00020000: 'glint_trail',
+                    0x00040000: 'trail_flag'
                    }
 
     # This is a mapping of the bit in the pixelflags field
-    #   to the boolean in the lsst v10 alert
+    #   to the boolean in the lsst v11.1 alert
     _pixelflags_bits = { 0x00000001: 'pixelFlags',
                          0x00000002: 'pixelFlags_bad',
                          0x00000004: 'pixelFlags_cr',
@@ -1709,8 +2000,12 @@ class DiaSourceExtra( DBBase ):
                          0x00010000: 'pixelFlags_injected',
                          0x00020000: 'pixelFlags_injectedCenter',
                          0x00040000: 'pixelFlags_injected_template',
-                         0x00080000: 'pixelFlags_injectedd_templateCenter',
+                         0x00080000: 'pixelFlags_injected_templateCenter',
                         }
+
+
+DiaSourceExtra._flags_bits_inverse = { v: k for k, v in DiaSourceExtra._flags_bits.items() }
+DiaSourceExtra._pixelflags_bits_inverse = { v: k for k, v in DiaSourceExtra._pixelflags_bits.items() }
 
 
 # ======================================================================
@@ -1735,6 +2030,25 @@ class DiaForcedSourceExtra( DBBase ):
     __tablename__ = "diaforcedsource_extra"
     _tablemeta = None
     _pk = [ 'diaforcedsourceid', 'base_procver_id' ]
+
+    # Try to keep these synced iwth DiaSourceExtra (no overlaps), just in
+    #   case a future LSST schema has new bools in one schema that were
+    #   previously already in the other.
+
+    _flags_bits = { 0x00000010: 'psfFlux_flag',
+                    0x00080000: 'invalidPsfFlag',
+                    0x00200000: 'diff_PixelFlags_nodataCenter'
+                   }
+
+    _pixelflags_bits = { k: v for k, v in DiaSourceExtra._pixelflags_bits.items()
+                         if v in ( 'pixelFlags_bad', 'pixelFlags_cr', 'pixelFlags_crCenter', 'pixelFlags_edge',
+                                   'pixelFlags_interpolated', 'pixelFlags_interpolatedCenter', 'pixelFlags_nodata',
+                                   'pixelFlags_saturated', 'pixelFlags_saturatedCenter', 'pixelFlags_suspect',
+                                   'pixelFlags_suspectCenter' ) }
+
+
+DiaForcedSourceExtra._flags_bits_inverse = { v: k for k, v in DiaForcedSourceExtra._flags_bits.items() }
+DiaForcedSourceExtra._pixelflags_bits_inverse = { v: k for k, v in DiaForcedSourceExtra._pixelflags_bits.items() }
 
 
 # ======================================================================

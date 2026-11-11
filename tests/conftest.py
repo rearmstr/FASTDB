@@ -3,9 +3,12 @@ import pytest
 import pathlib
 import uuid
 import itertools
+import copy
+import json
 
 import numpy as np
 import numpy.random
+import psycopg.sql as sql
 from pymongo import MongoClient
 
 from db import ( BaseProcessingVersion,
@@ -22,6 +25,7 @@ from db import ( BaseProcessingVersion,
                  DB,
                  DBCon,
                  AuthUser )
+import ltcv
 from util import asUUID
 import admin.load_snana_fits_ppdb
 from admin.load_snana_fits import FITSLoader
@@ -36,7 +40,8 @@ from fastdb.fastdb_client import FASTDBClient
 #   should all live in the fixtures subdirectory.
 pytest_plugins = [ 'fixtures.alertcycle',
                    'fixtures.spectrum',
-                   'fixtures.basedbtests'
+                   'fixtures.basedbtests',
+                   'fixtures.edp2'
                   ]
 
 
@@ -54,28 +59,62 @@ def procver_bases():
 
 @pytest.fixture( scope='module' )
 def procver_collection( procver_postimes, procver_bases ):
-    # A set of processing versions loaded into the database, including:
-    #
-    #   A set of base procesing versions pvc_bpv1, pvc_bpv1a, pvc_bpv1b, pvc_bpv2, pvc_bpv2a, pvc_bpv3, realtime
-    #   For each of these, there is a base processing version for tables diaobject, diaobject_position,
-    #     diasource, and diaforcedsource.
-    #
-    #   A set of processing versions with priorities (high to low)
-    #     pvc_pv1 : pvc_bpv1b, pvc_bpv1a, pvc_bpv1
-    #     pvc_pv2 : pvc_bpv2a, pvc_bpv2
-    #     pvc_pv3 : pvc_bpv3
-    #     realtime : realtime
-    #   A processing version alias default pointing at pvc_pv2
-    #
-    # (The fallbacks of pvc_pv2 and pvc_pv3 to the earlier bpvs are for Object handing in set_of_lightcurves)
-    #
-    # fixture value is a tuple of two dictionaries of str → BaseProcessingVersion, str → ProcessingVersion
-    #
-    # Keys for the processing versions are pv1, pv2, pv3, and realtime
-    # Keys for the base processing versions are {name} or {name}_{table},
-    #   where {name} is one of bpv1, bpv1a, bpv1b, bpv2, bpv2a, bpv3, realtime
-    #   and {table} is one of diaobject, diasource, diaforcedsource
-    # Base processing versions also have {name}_diaoject_position_{mjd} for diaobject_position
+    """A set of processing versions loaded into the database.
+
+    What gets loaded into the database:
+
+    * set of base procesing versions pvc_bpv1, pvc_bpv1a, pvc_bpv1b,
+      pvc_bpv2, pvc_bpv2a, pvc_bpv3, realtime.
+
+      For each of these, there is a base processing version for tables
+      diaobject, diasource, and diaforcedsource, and there are several
+      base processing versions for diaobject_position.
+
+    * A set of processing versions with priorities (high to low)
+        pvc_pv1 : pvc_bpv1b, pvc_bpv1a, pvc_bpv1
+        pvc_pv2 : pvc_bpv2a, pvc_bpv2
+        pvc_pv3 : pvc_bpv3
+        realtime : realtime
+
+    * A processing version alias default pointing at pvc_pv2
+
+    (The fallbacks of pvc_pv2 and pvc_pv3 to the earlier bpvs are for
+    Object handing in set_of_lightcurves) (...just read this months
+    later and I'm not sure it means.)
+
+    Yields
+    ------
+
+    ( bpvs, pvs, pvinfo )
+
+    * bpvs : dictionary of key : BaseProcessingVersion
+         Keys are {name} or {name}_{table}, where {name} is one of
+         [bpv1, bpv1a, bpv1b, bpv2, bpv2a, bpv3, realtime] (that is the
+         list returned by the procver_bases fiture) and {table} is one
+         of diaobject, diasource, diaforcedsource, or
+         diaobject_position_{mjd} (for a bunch of different mjds).  The
+         description of BaseProcessingVersion is the same as key with
+         "pvc_" prepended, except for realtime, where it's just
+         realtime.  (...yes that's annoying.  At some point in the past
+         I thought that was a good idea, who knows why.)
+
+    * pvs : dictionary of key : ProcessingVersion
+         Keys are (CHECK THIS) pv1, pv2, pv3, and realtime.  The
+         corresponding descriptions in the ProcessingVersion objects are
+         pvc_pv1, pvc_pv2, pvc_pv3, and realtime.
+
+    * pvinfo : list of dictionaries, each element of the list has:
+           { 'procver': ProcessingVersion
+             'diaobject': [ list of ( BaseProcessingVersion, priority, bpvkey ) ],
+             'diaobject_position': [ list of ( BaseProcessingVersion, priority, bpvkey ) ],
+             'diasource': [ list of ( BaseProcessingVersion, priority, bpvkey ) ],
+             'diaforcedsource': [ list of ( BaseProcessingVersion, priority, bpvkey ) ],
+           }
+         where bpvkey is is the key to use in the bpvs dictionary.  Each
+         list is sorted from higher priority to lower priority base
+         processing version.
+
+    """
 
     bpvs = {}
     pvs = {}
@@ -264,57 +303,71 @@ def procver_collection( procver_postimes, procver_bases ):
 
 @pytest.fixture( scope='module' )
 def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
-    # Define four root objects:
-    #   0-1: 2 within 15" of each other
-    #   2: 1 20" away
-    #   3: 1 much further away
-    #
-    # Objects 0 through 2 are in realtime as [ 0, 1, 2 ]
-    # Object 0 is in bpv1 as 100
-    # All objects are in bpv2 as [ 200, 201, 202, 203 ]
-    #   BUT object 1 is also in bpv2 as 2011
-    #
-    # Positions are stored at procver_postimes *if* the object still has a detection by the time
-    #   (diaobjects 203 and 2011 have no positions stored)
-    #
-    # Objects have lightcurves:
-    #     object 0 : first detection mjd 60000, last detection mjd 60030, peak 60010, mag 24
-    #     object 1 : first detection mjd 60020, last detection mjd 60060, peak 60035, mag 22
-    #     object 2 : first detection mjd 60040, last detection mjd 60080, peak 60050, mag 23
-    #     object 3 : first detection mjd 60050, last detection mjd 60060, peak 60055, mag 23.5
-    #
-    # All lightcurves have a candence of 2.5 days.  (I'm counting on
-    #   floats being perfectly representable in these ranges at
-    #   increments of 2.5, which I believe is true.)
-    #
-    # Full lightcurves are in bpv2 and bpv3
-    # Times [ 60020, 60030 ] have forcedsources in bpv2a
-    # Times [ 60020, 60025 ] have sources in bpv2a
-    # FOR OBJECT 1 IN bpv2 ONLY:
-    #    if mjd = floor(mjd), diasource and diaforcedsource are associated with object 201
-    #       otherwise diasource and diaforcedsource are associated with object 2011
-    #
-    # Photometry through 60060 and forced through 60055 is in realtime for objects 0 through 2
-    #
-    # Object 0:
-    #    photometry through 60015 and forced through 60010 in bpv1a
-    #    photometry through 60030 and forced through 60025 in bpv1
-    #
-    # RETURN STRUCTURE:
-    # [
-    #    { 'root':  RootDiaObject,
-    #      'obj':   { diaobjectid: DiaObject for all relevant object base processing versions },
-    #      'pos':   { (diaobjectid, bpv): DiaObjectPosition for all relevant position base processing versions },
-    #      'src':   { bpv: [ list of DiaSource ] },
-    #      'srcex': { bpv: [ list of DiaSourceExtra ] },
-    #      'frc':   { bpv: [ list of DiaForcedSource ] },
-    #      'frcex'  { bpv: [ list of DiaForcedSourceExtra ] }
-    #    }
-    # ]
-    #
-    # Ordered for object 0, 1, 2, 3
-    #
-    # all bpv keys are keys into the bpvs dictionary of the procver_collection fixture
+    """Load the database with lightcurves for four root objects.
+
+    Define four root objects:
+      0-1: 2 within 15" of each other
+      2: 1 20" away
+      3: 1 much further away
+
+    Objects 0 through 2 are in realtime as [ 0, 1, 2 ]
+    Object 0 is in bpv1 as 100
+    All objects are in bpv2 as [ 200, 201, 202, 203 ]
+      BUT object 1 is also in bpv2 as 2011
+
+    Positions are stored at procver_postimes *if* the object still has a detection by the time
+      (diaobjects 203 and 2011 have no positions stored)
+
+    Objects have lightcurves:
+        object 0 : first detection mjd 60000, last detection mjd 60030, peak 60010, mag 24
+        object 1 : first detection mjd 60020, last detection mjd 60060, peak 60035, mag 22
+        object 2 : first detection mjd 60040, last detection mjd 60080, peak 60050, mag 23
+        object 3 : first detection mjd 60050, last detection mjd 60060, peak 60055, mag 23.5
+
+    All lightcurves have a candence of 2.5 days.  (I'm counting on
+      floats being perfectly representable in these ranges at
+      increments of 2.5, which I believe is true.)
+
+    Full lightcurves are in bpv2 and bpv3
+    Times [ 60020, 60030 ] have forcedsources in bpv2a
+    Times [ 60020, 60025 ] have sources in bpv2a
+    FOR OBJECT 1 IN bpv2 ONLY:
+       if mjd = floor(mjd), diasource and diaforcedsource are associated with object 201
+          otherwise diasource and diaforcedsource are associated with object 2011
+
+    Photometry through 60060 and forced through 60055 is in realtime for objects 0 through 2
+
+    Object 0:
+       photometry through 60015 and forced through 60010 in bpv1a
+       photometry through 60030 and forced through 60025 in bpv1
+
+    For all diasource and diaforcedsource:
+      in bpv0 they point to the object in bpv0
+      in bpv1 they point to the object in bpv1
+      in bpv2 or bpv3, they point to the object in bpv2
+
+    Yields
+    ------
+      [
+         { 'root':  RootDiaObject,
+           'obj':   { diaobjectid: DiaObject for all relevant object base processing versions },
+           'pos':   { (diaobjectid, bpv): DiaObjectPosition for all relevant position base processing versions },
+           'src':   { bpv: [ list of DiaSource ] },
+           'srcex': { bpv: [ list of DiaSourceExtra ] },
+           'frc':   { bpv: [ list of DiaForcedSource ] },
+           'frcex'  { bpv: [ list of DiaForcedSourceExtra ] }
+         }
+      ]
+
+      Ordered for object 0, 1, 2, 3
+
+      all bpv keys are keys into the bpvs dictionary of the procver_collection fixture
+
+      The list of src and srcex for a given root object and bpv should
+      have the same length, BUT some of the srcex entries may be None.
+      Likewise for frc/frcex.
+
+    """
 
     roots = []
     rootobjs = []
@@ -350,7 +403,7 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
         #   we'll only use <1/25 of them.  Computers are fast.
         # Do np.floor(mjd*10) to get the index into these arrays.
         # We'll use the mjd=lowestmjd time for all forced photometry.  I think.
-        # 1σ scatter is going to be 0.2". (Yes, regardless of the S/N of hte
+        # 1σ scatter is going to be 0.2". (Yes, regardless of the S/N of the
         #   detection.  See NOTE below.)
         # Not going to worry about cos(dec)
         # NOTE : every object is going to scatter in the same direction
@@ -374,6 +427,10 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
         firstmag = [ 26., 25., 25.5, 25.8 ]
         lastmag = [ 25.9, 25.1, 25.6, 26. ]
         zeromag = 32.
+
+        # Also random-but-deterministic reliabilities and flags
+        reliability_rng = np.random.default_rng( 137 )
+        flags_rng = np.random.default_rng( 64738 )
 
         visit = 0
         for i, rootobj in enumerate(rootobjinfo):
@@ -484,7 +541,8 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
                                      band=( 'r' if visit%2==0 else 'i' ),
                                      midpointmjdtai=sourcemjd,
                                      psfflux=psfflux, psffluxerr=psffluxerr,
-                                     ra=ra['realtime'], dec=dec['realtime'] )
+                                     ra=ra['realtime'], dec=dec['realtime'],
+                                     raerr=0.2/3600., decerr=0.2/3600., ra_dec_cov=(0.05/3600.)**2 )
                     srcobjs.append( src )
                     rootdict['src']['realtime_diasource'].append( src )
 
@@ -493,7 +551,11 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
                                                 base_procver_id=src.base_procver_id,
                                                 detector=0,
                                                 x=1,
-                                                y=1 )
+                                                y=1,
+                                                reliability=reliability_rng.random(),
+                                                flags=flags_rng.integers( 2147483647, dtype=np.int32 ),
+                                                pixelflags=flags_rng.integers( 2147483647, dtype=np.int32 ),
+                                               )
                         srcexobjs.append( srcex )
                         rootdict['srcex']['realtime_diasource'].append( srcex )
                     else:
@@ -529,9 +591,13 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
                     if sourcemjd < 60050.:
                         frcex = DiaForcedSourceExtra( diaforcedsourceid=objr.diaobjectid * 1000000 + int(sourcemjd),
                                                       base_procver_id=frc.base_procver_id,
+                                                      diaobjectid=objr.diaobjectid,
+                                                      visit=visit,
                                                       detector=0,
                                                       scienceflux=1.1*psfflux,
                                                       sciencefluxerr=psffluxerr,
+                                                      flags=flags_rng.integers( 2147483647, dtype=np.int32 ),
+                                                      pixelflags=flags_rng.integers( 214748364, dtype=np.int32 ),
                                                       timeprocessedmjdtai=60365.,
                                                       timewithdrawnmjdtai=None )
                         frcexobjs.append( frcex )
@@ -539,7 +605,7 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
                     else:
                         rootdict['frcex']['realtime_diaforcedsource'].append( None )
 
-                # everything is in bpv2, bpv2a, bp3
+                # everything is in bpv2, bpv2a, bpv3
                 for bpv in [ 'bpv2', 'bpv2a', 'bpv3' ]:
                     # bpv2a only has sources for [ 60020, 60030 ] and forced sources for [ 60020, 60025 ]
                     if ( bpv == 'bpv2a' ) and ( ( sourcemjd < 60020. ) or ( sourcemjd > 60030. ) ):
@@ -561,7 +627,10 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
                                      psfflux=psfflux,
                                      psffluxerr=psffluxerr,
                                      ra=ra[bpv],
-                                     dec=dec[bpv] )
+                                     dec=dec[bpv],
+                                     raerr=0.2/3600.,
+                                     decerr=0.2/3600.,
+                                     ra_dec_cov=(0.05/3600.)**2 )
                     srcobjs.append( src )
                     rootdict['src'][f'{bpv}_diasource'].append( src )
 
@@ -570,11 +639,15 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
                                                 base_procver_id=src.base_procver_id,
                                                 detector=0,
                                                 x=1,
-                                                y=1 )
+                                                y=1,
+                                                reliability=reliability_rng.random(),
+                                                flags=flags_rng.integers( 2147483647, dtype=np.int32 ),
+                                                pixelflags=flags_rng.integers( 2147483647, dtype=np.int32 )
+                                               )
                         srcexobjs.append( srcex )
                         rootdict['srcex'][f'{bpv}_diasource'].append( srcex )
                     else:
-                        rootdict['srcex'][f'{bpv}_diasource'].append( srcex )
+                        rootdict['srcex'][f'{bpv}_diasource'].append( None )
 
                     if ( bpv != 'bpv2a' ) or ( sourcemjd <= 60025 ):
                         frc = DiaForcedSource( diaforcedsourceid=objtouse.diaobjectid * 1000000 + int(sourcemjd),
@@ -593,9 +666,13 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
                         if sourcemjd < 60050.:
                             frcex = DiaForcedSourceExtra( diaforcedsourceid=frc.diaforcedsourceid,
                                                           base_procver_id=frc.base_procver_id,
+                                                          diaobjectid=objtouse.diaobjectid,
+                                                          visit=visit,
                                                           detector=0,
                                                           scienceflux=1.1*psfflux,
                                                           sciencefluxerr=psffluxerr,
+                                                          flags=flags_rng.integers( 2147483647, dtype=np.int32 ),
+                                                          pixelflags=flags_rng.integers( 214748364, dtype=np.int32 ),
                                                           timeprocessedmjdtai=60365.,
                                                           timewithdrawnmjdtai=None )
                             frcexobjs.append( frcex )
@@ -629,7 +706,10 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
                                          psfflux=psfflux,
                                          psffluxerr=psffluxerr,
                                          ra=ra[bpv],
-                                         dec=dec[bpv] )
+                                         dec=dec[bpv],
+                                         raerr=0.2/3600.,
+                                         decerr=0.2/3600.,
+                                         ra_dec_cov=(0.05/3600.)**2 )
                         srcobjs.append( src )
                         rootdict['src'][f'{bpv}_diasource'].append( src )
 
@@ -638,7 +718,11 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
                                                     base_procver_id=src.base_procver_id,
                                                     detector=0,
                                                     x=1,
-                                                    y=1 )
+                                                    y=1,
+                                                    reliability=reliability_rng.random(),
+                                                    flags=flags_rng.integers( 2147483647, dtype=np.int32 ),
+                                                    pixelflags=flags_rng.integers( 2147483647, dtype=np.int32 )
+                                                   )
                             srcexobjs.append( srcex )
                             rootdict['srcex'][f'{bpv}_diasource'].append( srcex )
                         else:
@@ -663,9 +747,13 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
                         if sourcemjd < 60050.:
                             frcex = DiaForcedSourceExtra( diaforcedsourceid=obj1.diaobjectid * 1000000 + int(sourcemjd),
                                                           base_procver_id=frc.base_procver_id,
+                                                          diaobjectid=obj1.diaobjectid,
+                                                          visit=visit,
                                                           detector=0,
                                                           scienceflux=1.1*psfflux,
                                                           sciencefluxerr=psffluxerr,
+                                                          flags=flags_rng.integers( 2147483647, dtype=np.int32 ),
+                                                          pixelflags=flags_rng.integers( 214748364, dtype=np.int32 ),
                                                           timeprocessedmjdtai=60365.,
                                                           timewithdrawnmjdtai=None )
                             frcexobjs.append( frcex )
@@ -717,9 +805,13 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
                     if sourcemjd < 60050.:
                         frcex = DiaForcedSourceExtra( diaforcedsourceid=objr.diaobjectid * 1000000 + int(sourcemjd),
                                                       base_procver_id=frc.base_procver_id,
+                                                      diaobjectid=objr.diaobjectid,
+                                                      visit=visit,
                                                       detector=0,
                                                       scienceflux=1.1*psfflux,
                                                       sciencefluxerr=psffluxerr,
+                                                      flags=flags_rng.integers( 2147483647, dtype=np.int32 ),
+                                                      pixelflags=flags_rng.integers( 214748364, dtype=np.int32 ),
                                                       timeprocessedmjdtai=60365.,
                                                       timewithdrawnmjdtai=None )
                         frcexobjs.append( frcex )
@@ -755,9 +847,13 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
                     if sourcemjd < 60050.:
                         frcex = DiaForcedSourceExtra( diaforcedsourceid=objtouse.diaobjectid * 1000000 + int(sourcemjd),
                                                       base_procver_id=frc.base_procver_id,
+                                                      diaobjectid=objtouse.diaobjectid,
+                                                      visit=visit,
                                                       detector=0,
                                                       scienceflux=1.1*psfflux,
                                                       sciencefluxerr=psffluxerr,
+                                                      flags=flags_rng.integers( 2147483647, dtype=np.int32 ),
+                                                      pixelflags=flags_rng.integers( 214748364, dtype=np.int32 ),
                                                       timeprocessedmjdtai=60365.,
                                                       timewithdrawnmjdtai=None )
                         frcexobjs.append( frcex )
@@ -786,9 +882,13 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
                         if sourcemjd < 60050.:
                             frcex = DiaForcedSourceExtra( diaforcedsourceid=obj.diaobjectid * 1000000 + int(sourcemjd),
                                                           base_procver_id=frc.base_procver_id,
+                                                          diaobjectid=obj1.diaobjectid,
+                                                          visit=visit,
                                                           detector=0,
                                                           scienceflux=1.1*psfflux,
                                                           sciencefluxerr=psffluxerr,
+                                                          flags=flags_rng.integers( 2147483647, dtype=np.int32 ),
+                                                          pixelflags=flags_rng.integers( 214748364, dtype=np.int32 ),
                                                           timeprocessedmjdtai=60365.,
                                                           timewithdrawnmjdtai=None )
                             frcexobjs.append( frcex )
@@ -842,14 +942,17 @@ def set_of_lightcurves( procver_bases, procver_postimes, procver_collection ):
             con.commit()
 
 
-@pytest.fixture( scope='session' )
+@pytest.fixture( scope='module' )
 def test_user():
-    # Test user with password 'test_password'
-    user = AuthUser( id=asUUID('788e391e-ca63-4057-8788-25cc8647e722'),
-                     username='test',
-                     displayname='test user',
-                     email='test@nowhere.org',
-                     pubkey="""-----BEGIN PUBLIC KEY-----
+    # Username test, password test_password
+
+    try:
+        with DBCon() as dbcon:
+            userid=asUUID('788e391e-ca63-4057-8788-25cc8647e722')
+            user = AuthUser.create( userid=userid, username='test', displayname='test user', email='test@nowhere.org',
+                                    dbcon=dbcon )
+
+            pubkey = """-----BEGIN PUBLIC KEY-----
 MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA1QLihZJ78NHKppUBUaZI
 sel7WFKp/3Pr14nbel+BpfOVWrIIIiMegQSAliWRszNLQezKwHTXM4DUxZu7LG/q
 zut37v5WSVWCK8wSW+zy6e9vnuVkcrzdEJgkztUaiC8lMnHVE0ycpLTICcAu0wtv
@@ -863,22 +966,84 @@ xFuX4Hj8VtG89J3DSVJue4psF0wTYceUhUleJCG3gPxAyE2g4ObZZ9mh/gI1KG6v
 Np9CFWk9eMSeehEI1YKyPY8Hdv50PmIvN2zgxbo2wccspwCVTrtdKoQebpVAAu3v
 tyOci9saPPfI1bNnKD202zsCAwEAAQ==
 -----END PUBLIC KEY-----
-""",
-                     privkey={"iv": "z84DFtRURdKFhn3b",
-                              "salt": "57B2Nq/ZToHhVM+1DEq30g==",
-                              "privkey": "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"} # noqa: E501
-                    )
-    user.insert()
+"""
+            privkey = {"iv": "z84DFtRURdKFhn3b",
+                       "salt": "57B2Nq/ZToHhVM+1DEq30g==",
+                       "privkey": "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"} # noqa: E501
 
-    yield user
+            dbcon.execute_nofetch( sql.SQL( "UPDATE authuser SET pubkey={pubkey}, privkey={privkey}::JSONB "
+                                            "WHERE id={userid} "
+                                           ).format( userid=userid, pubkey=pubkey, privkey=json.dumps(privkey) ) )
+            dbcon.commit()
+            user.pubkey = pubkey
+            user.privkey = privkey
+            yield user
 
-    user.delete_from_db()
+    finally:
+        with DBCon() as dbcon:
+            dbcon.execute( "DELETE FROM authuser WHERE username='test'" )
+            dbcon.commit()
 
 
-@pytest.fixture( scope='session' )
+@pytest.fixture( scope="module" )
+def admin_user():
+    # In the noble tradition of routers everywhere, username admin, password admin
+
+    try:
+        with DBCon() as dbcon:
+            userid = asUUID('3ca778c4-4f9e-4182-bbf2-f5f154072c22')
+            user = AuthUser.create( userid=userid, username='admin', displayname='admin', email='admin@nowhere.org',
+                                    groups=['users', 'tag_create', 'admin'],  dbcon=dbcon )
+            pubkey = '''-----BEGIN PUBLIC KEY-----
+ MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAw+8D5eIkY1BKHkjmiifL
+ XTzpitg84xW292YWoLNd5nYCzudzZLb0wCZmIyB9Go7Qy/1vEAHctpD7u74QCevN
+ eDhfryTYHwD4Cfj1756htLtT4/M6UVxBV+gpQAQjko+otM6y900Rpkq8sidvNEWO
+ yZlgYU3jUDO4Xa6Pxxzfuf8W+hU1beIZosIVjqiJr4aX2ceItHJfEjKh/LtZjFsj
+ 2HUjPFLuU+AIFUxVdfHqPmX25OhMmCE/TffaUZUfNIE0B+kV5m9nlhdccwlhPrO0
+ 3mVS5rSOz4TE6TYEVmACaMYhMFI79tBk4/ld1p0ngW6VhAwW1GqQwOCUoXs9alUJ
+ Zh7qmSZy3t7XK/IUIAJdPmwfBF5tKwmoahCjn2LxzS3OCXoRwKPL0hvHUpmvfJKk
+ XTNX/gJ21mk4tncdbwy7y+TcfP38amLvC9axIm7rmXOL22K1FGsxBFxllzpYiRY2
+ dSOtSY3roih06f4wcyOfrWhWCbsR3zLZQ54L+pn4r1jae+RqSBqhslvsJQopnsMK
+ YTEaYDKcP9d+SsIh2N71VURYSVBEUko4QTBIxisPwgWewhKMN/vOOpiY1kXp2CQv
+ YoIHDVu28bZHOry9/T7nw5iwrqymXr9P2cYPosjmPj2Mee3XhgMlaPxj2B6z4qiT
+ lgq/YFNl4MiGzKRlUCURCgMCAwEAAQ==
+ -----END PUBLIC KEY-----
+'''
+            privkey = {"iv": "P3iF0nASKzuz/9BR",
+                       "salt": "tZXnze39AoYqUsGYQoAIWw==",
+                       "privkey": "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" } # noqa: E501
+
+
+            dbcon.execute_nofetch( sql.SQL( "UPDATE authuser SET pubkey={pubkey}, privkey={privkey}::JSONB "
+                                            "WHERE id={userid} "
+                                           ).format( userid=userid, pubkey=pubkey, privkey=json.dumps(privkey) ) )
+            dbcon.commit()
+            user.pubkey = pubkey
+            user.privkey = privkey
+            yield user
+
+    finally:
+        with DBCon() as dbcon:
+            dbcon.execute( "DELETE FROM authuser WHERE username='admin'" )
+            dbcon.commit()
+
+
+@pytest.fixture( scope='module' )
+def dbclient( test_user ):
+    return FASTDBClient( 'http://webap:8080', username='test', password='test_password' )
+
+
+# ...this fixture is redundant with the previous one, but somehow I managed to make a mess
+#   and have lots of tests that use one, and lots of tests that use the other.
+# Cleaning that up should be its own PR.
+@pytest.fixture( scope='module' )
 def fastdb_client( test_user ):
-    return FASTDBClient( 'http://webap:8080', username="test", password="test_password", verify=False, debug=True,
-                         retrysleep=0.1, retries=2 )
+    return FASTDBClient( 'http://webap:8080', username='test', password='test_password' )
+
+
+@pytest.fixture( scope='module' )
+def admin_dbclient( admin_user ):
+    return FASTDBClient( 'http://webap:8080', username='admin', password='admin' )
 
 
 @pytest.fixture( scope='session' )
@@ -982,12 +1147,12 @@ def mongoclient_rw():
 @pytest.fixture( scope='module' )
 def lightcurve_checker( set_of_lightcurves, procver_collection ):
 
-    def check_ltcv_res( procver, expected_roots, expected_diaobjectids, res, single=False,
+    def check_ltcv_res( procver, expected_roots, expected_diaobjectids, res, single=False, rootid_is_uuid=True,
                         mjd_now=None, bands=None, which='patch', return_object_info=False,
-                        include_object_positions=False,
+                        return_diaobject_positions=False, nonevalue=None,
+                        include_reliability=False, include_bitflags=False, flags_nonevalue=False,
                         include_base_procver=False, include_source_ids=False, include_source_positions=False,
-                        use_weighted_source_positions=False, always_use_weighted_source_positions=False,
-                        expect_all_roots=True ):
+                        use_weighted_source_positions=False, expect_all_roots=True ):
         # This has a lot of redundancy with test_ltcv.py::compare_ltcv_to_expected
         bpvs, pvs, pvinfo = procver_collection
         roots = set_of_lightcurves
@@ -1002,30 +1167,38 @@ def lightcurve_checker( set_of_lightcurves, procver_collection ):
         pvrow = pvrow[0]
 
         expected_root_ids = [ roots[i]['root'].id for i in expected_roots ]
-        use_weighted_source_positions = use_weighted_source_positions or always_use_weighted_source_positions
+
+        # Make a copy of res so we can screw it up without worry
+        res = copy.deepcopy( res )
 
         # ...there are a few different tests that call this that get things wrapped different ways.
         if return_object_info:
             if isinstance( res, tuple ):
+                assert isinstance( res[1], dict )
                 if single:
                     assert isinstance( res[0], dict )
                     ltcvs = [ res[0] ]
+                    assert isinstance( res[1], dict )
+                    infos = { k: [v] for k, v in res[1].items() }
                 else:
                     assert isinstance( res[0], list )
                     ltcvs = res[0]
-                infos = res[1]
+                    assert all( isinstance( v, list ) for v in res[1].values() )
+                    infos = res[1]
             else:
                 assert isinstance( res, dict )
+                assert isinstance( res['objinfo'], dict )
                 if single:
                     assert set( res.keys() ) == { 'ltcv', 'objinfo' }
                     assert isinstance( res['ltcv'], dict )
                     ltcvs = [ res['ltcv'] ]
+                    infos = { k: [v] for k, v in res['objinfo'].items() }
                 else:
                     assert set( res.keys() ) == { 'ltcvs', 'objinfo' }
                     assert isinstance( res['ltcvs'], list )
+                    assert all( isinstance( v, list ) for v in res['objinfo'].values() )
                     ltcvs = res['ltcvs']
-                assert isinstance( res['objinfo'], dict )
-                infos = res[ 'objinfo' ]
+                    infos = res['objinfo']
         else:
             if single:
                 assert isinstance( res, dict )
@@ -1035,12 +1208,24 @@ def lightcurve_checker( set_of_lightcurves, procver_collection ):
                 ltcvs = res
             infos = None
 
-        if ( len(ltcvs) > 0 ) and isinstance( ltcvs[0]['rootid'], uuid.UUID ):
-            rootid_is_uuid = True
+        if rootid_is_uuid:
             assert all( isinstance( lc['rootid'], uuid.UUID ) for lc in ltcvs )
+            if return_object_info:
+                assert all( isinstance( oi, uuid.UUID ) for oi in infos['rootid'] )
         else:
-            rootid_is_uuid = False
             assert all( isinstance( lc['rootid'], str ) for lc in ltcvs )
+            # Convert to UUIDs for the convenience of the rest of this function
+            #   (Also has the happy side effect of raising an exception if any
+            #   of the strings aren't uuidifiable.)
+            for lc in ltcvs:
+                lc['rootid'] = asUUID( lc['rootid'] )
+            if return_object_info:
+                assert all( isinstance( oi, str ) for oi in infos['rootid'] )
+                infos['rootid'] = [ asUUID(oi) for oi in infos['rootid'] ]
+        if return_object_info:
+            assert all( ltcvs[i]['rootid'] == r for i, r in enumerate( infos['rootid'] ) )
+
+        assert all( all( isinstance( lc[col], list ) for col in lc.keys() if col != 'rootid' ) for lc in ltcvs )
 
         expected_keys = [ 'rootid', 'mjd', 'diasourceid', 'source_diaobjectid',
                           'visit', 'band', 'flux', 'fluxerr', 'isdet' ]
@@ -1054,41 +1239,40 @@ def lightcurve_checker( set_of_lightcurves, procver_collection ):
                 expected_keys.append( 'base_procver_f' )
         if include_source_positions:
             expected_keys.extend( [ 'det_ra', 'det_dec', 'det_raerr', 'det_decerr', 'det_ra_dec_cov' ] )
+        if include_reliability:
+            expected_keys.append( 'reliability' )
+        if include_bitflags:
+            expected_keys.extend( [ 'flags', 'pixelflags' ] )
 
         if not single:
             if expect_all_roots:
                 assert len( ltcvs ) == len( expected_roots )
-                if rootid_is_uuid:
-                    assert set( lc['rootid'] for lc in ltcvs ) == set( expected_root_ids )
-                else:
-                    assert set( lc['rootid'] for lc in ltcvs ) == set( str(r) for r in expected_root_ids )
+                assert set( lc['rootid'] for lc in ltcvs ) == set( expected_root_ids )
             else:
                 assert len( set( lc['rootid'] for lc in ltcvs ) ) == len( ltcvs )
-                if rootid_is_uuid:
-                    assert set( lc['rootid'] for lc in ltcvs ).issubset( expected_root_ids )
-                else:
-                    assert set( lc['rootid'] for lc in ltcvs ).issubset( set( str(r) for r in expected_root_ids ) )
+                assert set( lc['rootid'] for lc in ltcvs ).issubset( expected_root_ids )
 
         datacache = {}
         for rootid in expected_root_ids:
-            rdex = None
-            for i, root in enumerate( roots ):
-                if root['root'].id == rootid:
-                    rdex = i
-                    break
-            if rdex is None:
+            try:
+                rdex = [ r['root'].id for r in roots ].index( rootid )
+            except ValueError:
                 raise ValueError( "Failed to find root object {rootid}" )
 
             if single:
                 thisltcv = ltcvs[0]
-                assert thisltcv['rootid'] == ( rootid if rootid_is_uuid else str(rootid) )
+                assert thisltcv['rootid'] == rootid
             elif len(ltcvs) == 0:
                 # Logically, if we get here, expect_all_roots must be false
                 continue
 
-            dexen = [ i for i, lc in enumerate( ltcvs )
-                      if lc['rootid'] == ( rootid if rootid_is_uuid else str(rootid) ) ]
-            assert len(dexen) == 1
+            dexen = [ i for i, lc in enumerate( ltcvs ) if lc['rootid'] == rootid ]
+            if len(dexen) > 1:
+                raise RuntimeError( "This should never happen." )
+            elif len(dexen) == 0:
+                assert not expect_all_roots
+                continue
+
             thisltcv = ltcvs[ dexen[0] ]
 
             assert all( len(thisltcv[k]) == len(thisltcv['mjd']) for k in expected_keys
@@ -1112,8 +1296,16 @@ def lightcurve_checker( set_of_lightcurves, procver_collection ):
             frc_bpvkeys = [ p[2] for p in pvrow['diaforcedsource'] ]
             reindexed_srces = { k: { s.visit: s for s in roots[rdex]['src'][k] if conds(s) }
                                 for k in src_bpvkeys if k in roots[rdex]['src'].keys() }
+            reindexed_srcexes = { k: { s.visit: sx
+                                       for s, sx in zip( roots[rdex]['src'][k], roots[rdex]['srcex'][k] )
+                                       if conds(s) }
+                                  for k in src_bpvkeys if k in roots[rdex]['src'].keys() }
             reindexed_frced = { k: { f.visit: f for f in roots[rdex]['frc'][k] if conds(f) }
                                 for k in frc_bpvkeys if k in roots[rdex]['frc'].keys() }
+            reindexed_frcedexes = { k: { f.visit: fx
+                                         for f, fx in zip( roots[rdex]['frc'][k], roots[rdex]['frcex'][k] )
+                                         if conds(f) }
+                                    for k in frc_bpvkeys if k in roots[rdex]['frc'].keys() }
 
             # Visit is the thing that lets us decide if a diasource and a diaforcedsource are the same thing.
             # Get the set of visits defined for this object.
@@ -1132,6 +1324,7 @@ def lightcurve_checker( set_of_lightcurves, procver_collection ):
                     if bpvkey in reindexed_srces:
                         if visit in reindexed_srces[bpvkey]:
                             thisdata['src'] = reindexed_srces[bpvkey][visit]
+                            thisdata['srcex'] = reindexed_srcexes[bpvkey][visit]
                             thisdata['src_bpv'] = bpv
                             srcgotit = True
                             break
@@ -1142,6 +1335,7 @@ def lightcurve_checker( set_of_lightcurves, procver_collection ):
                     if bpvkey in reindexed_frced:
                         if visit in reindexed_frced[bpvkey]:
                             thisdata['frc'] = reindexed_frced[bpvkey][visit]
+                            thisdata['frcex'] = reindexed_frcedexes[bpvkey][visit]
                             thisdata['frc_bpv'] = bpv
                             frcgotit = True
                             break
@@ -1165,6 +1359,7 @@ def lightcurve_checker( set_of_lightcurves, procver_collection ):
                 data = [ d for d in data if d['frc'] is not None ]
 
             # OK, now we have wrangled things to the point where they can be compared
+            flags_nonevalue = nonevalue if flags_nonevalue == False else flags_nonevalue
 
             assert len( data ) == len( thisltcv['mjd'] )
             if which == 'detections':
@@ -1184,7 +1379,7 @@ def lightcurve_checker( set_of_lightcurves, procver_collection ):
                 assert all( bool(i) == ( d['src'] is not None ) for i, d in zip( thisltcv['isdet'], data ) )
                 assert all( v == d['frc'].visit for v, d in zip( thisltcv['visit'], data ) )
                 assert all( b == d['frc'].band for b, d in zip( thisltcv['band'], data ) )
-                assert all( o == ( d['src'].diaobjectid if d['src'] is not None else None )
+                assert all( o == ( d['src'].diaobjectid if d['src'] is not None else nonevalue )
                             for o, d in zip( thisltcv['source_diaobjectid'], data ) )
                 assert all( o == d['frc'].diaobjectid for o, d in zip( thisltcv['forced_diaobjectid'], data ) )
             else:
@@ -1202,16 +1397,16 @@ def lightcurve_checker( set_of_lightcurves, procver_collection ):
                             for v, d in zip( thisltcv['visit'], data ) )
                 assert all( b == ( d['frc'].band if d['frc'] is not None else d['src'].band )
                             for b, d in zip( thisltcv['band'], data ) )
-                assert all( o == ( d['src'].diaobjectid if d['src'] is not None else None )
+                assert all( o == ( d['src'].diaobjectid if d['src'] is not None else nonevalue )
                             for o, d in zip( thisltcv['source_diaobjectid'], data ) )
-                assert all( o == ( d['frc'].diaobjectid if d['frc'] is not None else None )
+                assert all( o == ( d['frc'].diaobjectid if d['frc'] is not None else nonevalue )
                             for o, d in zip( thisltcv['forced_diaobjectid'], data ) )
 
             if include_base_procver:
-                assert all( v == ( d['src_bpv'].description if d['src_bpv'] is not None else None )
+                assert all( v == ( d['src_bpv'].description if d['src_bpv'] is not None else nonevalue )
                             for v, d in zip( thisltcv['base_procver_s'], data ) )
                 if which != 'detections':
-                    assert all( v == ( d['frc_bpv'].description if d['frc_bpv'] is not None else None )
+                    assert all( v == ( d['frc_bpv'].description if d['frc_bpv'] is not None else nonevalue )
                                 for v, d in zip( thisltcv['base_procver_f'], data ) )
 
             if include_source_positions:
@@ -1228,163 +1423,519 @@ def lightcurve_checker( set_of_lightcurves, procver_collection ):
                         #  ra_dec_cov to be close to 0, so it's unreasonable to expect full float64 precision
                         assert thisltcv['det_ra_dec_cov'][i] == pytest.approx( d['src'].ra_dec_cov, abs=0.0001/3600. )
 
-        if infos is not None:
+            if include_reliability:
+                assert all( v == ( nonevalue if ( ( 'srcex' not in d ) or
+                                                  ( d['srcex'] is None ) or
+                                                  ( d['srcex'].reliability is None ) )
+                                   else pytest.approx( d['srcex'].reliability, abs=0.0001 ) )
+                            for v, d in zip( thisltcv['reliability'], data ) )
 
-            expected_obj_keys = { 'diaobjectid', 'rootid' }
+            if include_bitflags:
+                if which == 'detections':
+                    assert all( v == ( flags_nonevalue if ( ( 'srcex' not in d ) or
+                                                            ( d['srcex'] is None ) or
+                                                            ( d['srcex'].flags is None ) )
+                                       else d['srcex'].flags )
+                                for v, d in zip( thisltcv['flags'], data ) )
+                    assert all( v == ( flags_nonevalue if ( ('srcex' not in d ) or
+                                                            ( d['srcex'] is None ) or
+                                                            ( d['srcex'].pixelflags is None )  )
+                                       else d['srcex'].pixelflags )
+                                for v, d in zip( thisltcv['pixelflags'], data ) )
+                elif which == 'forced':
+                    assert all( v == ( flags_nonevalue if ( ( 'frcex' not in d ) or
+                                                            ( d['frcex'] is None ) or
+                                                            ( d['frcex'].flags is None ) )
+                                       else d['frcex'].flags )
+                                for v, d in zip( thisltcv['flags'], data ) )
+                    assert all( v == ( flags_nonevalue if ( ('frcex' not in d ) or
+                                                            ( d['frcex'] is None ) or
+                                                            ( d['frcex'].pixelflags is None )  )
+                                       else d['frcex'].pixelflags )
+                                for v, d in zip( thisltcv['pixelflags'], data ) )
+                else:
+                    # OMG
+                    assert all( v == ( ( flags_nonevalue if ( ( 'frcex' not in d ) or
+                                                              ( d['frcex'] is None ) or
+                                                              ( d['frcex'].flags is None ) )
+                                         else d['frcex'].flags )
+                                       if d['frc'] is not None else
+                                       ( flags_nonevalue if ( ( 'srcex' not in d ) or
+                                                              ( d['srcex'] is None ) or
+                                                              ( d['srcex'].flags is None ) )
+                                         else d['srcex'].flags )
+                                      ) for v, d in zip( thisltcv['flags'], data ) )
+                    assert all( v == ( ( flags_nonevalue if ( ('frcex' not in d ) or
+                                                              ( d['frcex'] is None ) or
+                                                              ( d['frcex'].pixelflags is None )  )
+                                         else d['frcex'].pixelflags )
+                                       if d['frc'] is not None else
+                                       ( flags_nonevalue if ( ('srcex' not in d ) or
+                                                              ( d['srcex'] is None ) or
+                                                              ( d['srcex'].pixelflags is None )  )
+                                         else d['srcex'].pixelflags )
+                                      ) for v, d in zip( thisltcv['pixelflags'], data ) )
+
+
+        if infos is not None:
+            expected_obj_keys = { 'rootid', 'diaobjectid', 'ra', 'dec' }
             if include_base_procver:
                 expected_obj_keys.add( 'obj_base_procver' )
-            if include_object_positions:
-                expected_obj_keys = expected_obj_keys.union( { 'ra', 'dec', 'raerr', 'decerr', 'ra_dec_cov' } )
+            if use_weighted_source_positions:
+                expected_obj_keys = expected_obj_keys.union( { 'raerr', 'decerr', 'ra_dec_cov' } )
+            if include_base_procver:
+                expected_obj_keys.add( 'obj_base_procver' )
+            if return_diaobject_positions:
+                expected_obj_keys = expected_obj_keys.union( { 'diaobject_ra', 'diaobject_dec', 'diaobject_raerr',
+                                                               'diaobject_decerr', 'diaobject_ra_dec_cov' } )
                 if include_base_procver:
                     expected_obj_keys.add( 'pos_base_procver' )
 
             assert set( infos.keys() ) == expected_obj_keys
 
-            if ( len(infos['rootid'])> 0 ) and ( isinstance( infos['rootid'][0], uuid.UUID ) ):
-                assert set( infos['rootid'] ) == set( expected_root_ids )
-            else:
-                assert set( infos['rootid'] ) == set( str(e) for e in expected_root_ids )
-            assert len( infos['diaobjectid'] ) == len( expected_diaobjectids )
-            assert set( infos['diaobjectid'] ) == set( expected_diaobjectids )
+            for dex in range( len(infos['rootid']) ):
+                ltcv = ltcvs[dex]
+                assert ltcv['rootid'] == infos['rootid'][dex]
+                exproot = [ r for r in roots if r['root'].id == infos['rootid'][dex] ]
+                if len(exproot) != 1:
+                    raise RuntimeError( "Something bad has happened." )
+                exproot = exproot[0]
 
-            for r in expected_roots:
+                if not use_weighted_source_positions:
+                    assert infos['ra'][dex] == pytest.approx( exproot['root'].ra, rel=1e-12 )
+                    assert infos['dec'][dex] == pytest.approx( exproot['root'].dec, rel=1-12 )
+                else:
+                    # Sanity check.  There are other tests that make
+                    # sure that many_object_ltcvs returned the right
+                    # stuff, but here we want to make sure that all the
+                    # utterly tangled data sturcture wrangling we've
+                    # done is right so that we calculate the mean
+                    # positions we expect to calculate.
+                    thisdatacache = datacache[exproot['root'].id]
+                    expecteddex = np.array( [ i for i, dc in enumerate(thisdatacache)
+                                              if ( ( which == 'patch' )
+                                                   or ( ( which == 'detections' ) and ( dc['src'] is not None ) )
+                                                   or ( ( which == 'forced' ) and ( dc['frc'] is not None ) )
+                                                  )
+                                             ] )
+                    if which != 'forced':
+                        assert len(expecteddex) == len( ltcv['diasourceid'] )
+                    if which != 'detections':
+                        assert len(expecteddex) == len( ltcv['diaforcedsourceid'] )
+                    for li, di in enumerate( expecteddex ):
+                        if which != 'forced':
+                            assert ( ( ( thisdatacache[di]['src'] is None )
+                                       and ( ltcv['diasourceid'][li] is None ) )
+                                     or ( thisdatacache[di]['src'].diasourceid
+                                          == ltcv['diasourceid'][li] )
+                                    )
+                        if which != 'detections':
+                            assert ( ( ( thisdatacache[di]['frc'] is None )
+                                       and ( ltcv['diaforcedsourceid'][li] is None ) )
+                                     or ( thisdatacache[di]['frc'].diaforcedsourceid
+                                          == ltcv['diaforcedsourceid'][li] )
+                                    )
+                        if which == 'detections':
+                            assert ltcv['flux'][li] == pytest.approx( thisdatacache[di]['src'].psfflux,
+                                                                            rel=1e-5 )
 
-                # These next two lines are gratitous, but can be useful for debugging
-                dexen = [ i for i, lc in enumerate( ltcvs )
-                          if lc['rootid'] == ( roots[r]['root'].id if rootid_is_uuid
-                                               else str(roots[r]['root'].id) ) ]
-                thisltcv = ltcvs[dexen[0]]
+                            assert ltcv['fluxerr'][li] == pytest.approx( thisdatacache[di]['src'].psffluxerr,
+                                                                               rel=1e-5 )
+                        elif which == 'forced':
+                            assert ltcv['flux'][li] == pytest.approx( thisdatacache[di]['frc'].psfflux,
+                                                                            rel=1e-5 )
 
-                for diaobjectid in expected_diaobjectids:
-                    if diaobjectid not in roots[r]['obj'].keys():
-                        # ... is this an error?
-                        continue
-                    diaobject = roots[r]['obj'][diaobjectid]
-                    dex = infos['diaobjectid'].index( diaobjectid )
-                    if isinstance( infos['rootid'][dex], uuid.UUID ):
-                        assert infos['rootid'][dex] == diaobject.rootid
-                    else:
-                        assert infos['rootid'][dex] == str( diaobject.rootid )
-                    if include_base_procver:
-                        # TODO : make sure the *right* processing version was returned!
-                        # ...actually... the fixtures only have objects in a single base processing
-                        # version for each processing version, so that wouldn't be an interesting test right now.
-                        bpv = [ b[0] for b in pvrow['diaobject'] if b[0].description==infos['obj_base_procver'][dex] ]
-                        assert len(bpv) == 1
-                        bpv = bpv[0]
-                        assert diaobject.base_procver_id == bpv.id
-
-                    if include_object_positions:
-                        pos = None
-
-                        if always_use_weighted_source_positions:
-                            pos = None
-                            if include_base_procver and return_object_info:
-                                assert infos['pos_base_procver'][dex] is None
-
+                            assert ltcv['fluxerr'][li] == pytest.approx( thisdatacache[di]['frc'].psffluxerr,
+                                                                               rel=1e-5 )
                         else:
-                            # There are multiple positions, so make sure we got the highest priority one that exists
-                            #
-                            # OMG this is becoming such an ugly hack of how I store data, this is what
-                            #   happens when you just need to get stuff done fast and can't go back
-                            #   and refactor.
-                            pos = None
-                            posbpv = None
-                            for proposedposbpv, prio, bpvkey in pvrow['diaobject_position']:
-                                if (diaobjectid, bpvkey) in roots[r]['pos'].keys():
-                                    pos = roots[r]['pos'][ (diaobjectid, bpvkey) ]
-                                    posbpv = proposedposbpv
-                                    break
+                            assert ( ( ( thisdatacache[di]['frc'] is None )
+                                       and
+                                       ( ltcv['flux'][li] == pytest.approx( thisdatacache[di]['src'].psfflux,
+                                                                                  rel=1e-5 ) )
+                                       and
+                                       ( ltcv['fluxerr'][li] ==
+                                         pytest.approx( thisdatacache[di]['src'].psffluxerr, rel=1e-5 ) )
+                                      )
+                                     or
+                                     ( ( thisdatacache[di]['frc'] is not None )
+                                       and
+                                       ( ltcv['flux'][li] == pytest.approx( thisdatacache[di]['frc'].psfflux,
+                                                                                  rel=1e-5 ) )
+                                       and
+                                       ( ltcv['fluxerr'][li] ==
+                                         pytest.approx( thisdatacache[di]['frc'].psffluxerr, rel=1e-5 ) )
+                                      )
+                                    )
+                    # Uf-da
 
-                            if include_base_procver:
-                                if ( pos is None ) or always_use_weighted_source_positions:
-                                    assert infos['pos_base_procver'][dex] is None
-                                else:
-                                    assert infos['pos_base_procver'][dex] == posbpv.description
+                    justsrcs = [ d for d in datacache[exproot['root'].id] if d['src'] is not None ]
+                    srcra = np.array( [ j['src'].ra for j in justsrcs ] )
+                    srcdec = np.array( [ j['src'].dec for j in justsrcs ] )
+                    srcraerr = np.array( [ j['src'].raerr for j in justsrcs ] )
+                    srcdecerr = np.array( [ j['src'].decerr for j in justsrcs ] )
+                    src_ra_dec_cov = np.array( [ j['src'].ra_dec_cov for j in justsrcs ] )
 
-                            if pos is not None:
-                                assert infos['ra'][dex] == pytest.approx( pos.ra, rel=1e-12 )
-                                assert infos['dec'][dex] == pytest.approx( pos.dec, rel=1e-12 )
-                                assert infos['raerr'][dex] == pytest.approx( pos.raerr, rel=1e-6 )
-                                assert infos['decerr'][dex] == pytest.approx( pos.decerr, rel=1e-6 )
-                                # Fixture didn't put any correlations in but for random variancer
-                                assert infos['ra_dec_cov'][dex] == pytest.approx( pos.ra_dec_cov, abs=0.0001/3600. )
+                    if which == 'detections':
+                        sn = np.array( [ j['src'].psfflux / j['src'].psffluxerr for j in justsrcs ] )
+                    else:
+                        # ... this may be wholly gratuitous because I don't think
+                        #     the fixtures set a different forced flux from the source flux
+                        # However, this is the equivalent logic server-side.
+                        sn = np.array( [ ( j['frc'].psfflux / j['frc'].psffluxerr )
+                                         if j['frc'] is not None
+                                         else ( j['src'].psfflux / j['src'].psffluxerr )
+                                         for j in justsrcs ] )
+                    w = np.where( sn > 3 )[0]
+                    srcra = srcra[w]
+                    srcdec = srcdec[w]
+                    weight = sn[w] ** 2
+                    meanra = ( srcra * weight ).sum() / ( weight.sum() )
+                    meandec = ( srcdec * weight ).sum() / ( weight.sum() )
+                    raerr = np.sqrt( ( weight * ( srcra - meanra )**2 ).sum() / weight.sum() )
+                    decerr = np.sqrt( ( weight * ( srcdec - meandec )**2 ).sum() / weight.sum() )
+                    ra_dec_cov = ( weight * ( srcra - meanra ) * ( srcdec - meandec ) ).sum() / weight.sum()
 
-                        if use_weighted_source_positions:
-                            justsrcs = [ d for d in datacache[roots[r]['root'].id] if d['src'] is not None ]
-                            srcra = np.array( [ j['src'].ra for j in justsrcs ] )
-                            srcdec = np.array( [ j['src'].dec for j in justsrcs ] )
+                    if len(srcra) == 0:
+                        # No sources to calculate mean positions, so we should just get the
+                        # root position back
+                        assert infos['ra'][dex] == pytest.approx( exproot['root'].ra, rel=1e-12 )
+                        assert infos['dec'][dex] == pytest.approx( exproot['root'].dec, rel=1e-12 )
+                        assert all( ( infos[i][dex] is None ) or np.isnan( infos[i][dex] )
+                                    for i in ( 'raerr', 'decerr', 'ra_dec_cov' ) )
+                    elif len(srcra) > 1:
+                        # Should *not* match the root ra and dec
+                        assert infos['ra'][dex] != pytest.approx( exproot['root'].ra, rel=1e-9 )
+                        assert infos['dec'][dex] != pytest.approx( exproot['root'].dec, rel=1e-9 )
+                        # Check the weighted calculation.  (I.e. make sure that either the code in
+                        # ltcv.py is right and my code above is right, or that both of them are wrong
+                        # in the same way....)
+                        assert infos['ra'][dex] == pytest.approx( meanra, rel=1e-12 )
+                        assert infos['dec'][dex] == pytest.approx( meandec, rel=1e-12 )
+                        assert infos['raerr'][dex] == pytest.approx( raerr, rel=1e-6 )
+                        assert infos['decerr'][dex] == pytest.approx( decerr, rel=1e-6 )
+                        # Fixture didn't put any correlations in
+                        assert infos['ra_dec_cov'][dex] == pytest.approx( ra_dec_cov, abs=0.0001/3600. )
+                    elif len(srcra) == 1:
+                        # ...might match the root ra and dec... maybe... probably not... eh, whatevs
+                        assert infos['ra'][dex] == pytest.approx( srcra[0], rel=1e-12 )
+                        assert infos['dec'][dex] == pytest.approx( srcdec[0], rel=1e-12 )
+                        assert infos['raerr'][dex] == pytest.approx( srcraerr[0], rel=1e-6 )
+                        assert infos['decerr'][dex] == pytest.approx( srcdecerr[0], rel=1e-6 )
+                        assert infos['ra_dec_cov'][dex] == pytest.approx( src_ra_dec_cov[0],
+                                                                          abs=0.0001/3600. )
+                    else:
+                        raise RuntimeError( "This *really* should never happen." )
 
-                            if which == 'detections':
-                                sn = np.array( [ j['src'].psfflux / j['src'].psffluxerr for j in justsrcs ] )
+                for i in range( len (infos['diaobjectid'][dex] ) ):
+                    objid = infos['diaobjectid'][dex][i]
+                    assert objid in exproot['obj'].keys()
+                    if include_base_procver:
+                        assert asUUID( infos['obj_base_procver'][dex][i] ) == exproot['obj'][objid].base_procver_id
+                    if return_diaobject_positions:
+                        # There are multiple positions, so make sure we got the highest priority one that exists
+                        #
+                        # OMG this is becoming such an ugly hack of how I store data, this is what
+                        #   happens when you just need to get stuff done fast and can't go back
+                        #   and refactor.
+                        pos = None
+                        posbpv = None
+                        for proposedposbpv, prio, bpvkey in pvrow['diaobject_position']:
+                            if (objid, bpvkey) in exproot['pos'].keys():
+                                pos = exproot['pos'][ (objid, bpvkey) ]
+                                posbpv = proposedposbpv
+                                break
+                        if include_base_procver:
+                            if pos is None:
+                                assert infos['pos_base_procver'][dex][i] is None
                             else:
-                                # ... this may be wholly gratuitous because I don't think
-                                #     the fixtures set a different forced flux from the source flux
-                                # However, this is the equivalent logic server-side.
-                                sn = np.array( [ ( j['frc'].psfflux / j['frc'].psffluxerr )
-                                                 if j['frc'] is not None
-                                                 else ( j['src'].psfflux / j['src'].psffluxerr )
-                                                 for j in justsrcs ] )
-                            w = np.where( sn > 3 )[0]
+                                assert asUUID( infos['pos_base_procver'][dex][i] ) == posbpv.id
+                        for attr in [ 'ra', 'dec', 'raerr', 'decerr', 'ra_dec_cov' ]:
+                            col = f"diaobject_{attr}"
+                            rel = 1e-12 if col in [ 'ra', 'dec' ] else 1e-6
+                            assert ( ( ( infos[col][dex][i] is None ) and ( pos is None ) )
+                                     or
+                                     ( infos[col][dex][i] == pytest.approx( getattr(pos, attr), rel=rel ) )
+                                    )
 
-                            # ****
-                            # ltcvras = np.array( [ thisltcv['det_ra'][i] for i in range(len(thisltcv['isdet']))
-                            #                       if thisltcv['isdet'][i] ] )
-                            # ltcvdecs = np.array( [ thisltcv['det_dec'][i] for i in range(len(thisltcv['isdet']))
-                            #                        if thisltcv['isdet'][i] ] )
-                            # ltcvfluxes = np.array( [ thisltcv['flux'][i] for i in range(len(thisltcv['isdet']))
-                            #                          if thisltcv['isdet'][i] ] )
-                            # ltcvfluxerrs = np.array( [ thisltcv['fluxerr'][i] for i in range(len(thisltcv['isdet']))
-                            #                            if thisltcv['isdet'][i] ] )
-                            # justfluxes = np.array( [ s['src'].psfflux for s in justsrcs ] )
-                            # justfluxerrs = np.array( [ s['src'].psffluxerr for s in justsrcs ] )
-
-                            # FDBLogger.info( f"procver={procver}, which={which}, rootid={roots[r]['root'].id}, "
-                            #                 f"diaobjectid={diaobjectid}\n"
-                            #                 f"  ( thisltcv.det_ra - srcra ) / srcra = "
-                            #                 f"{( ltcvras - srcra ) / srcra}\n"
-                            #                 f"  ( thisltcv.det_dec - srcdec ) / srcdec = "
-                            #                 f"{( ltcvdecs - srcdec ) / srcdec}\n"
-                            #                 f"  ( thisltcv.flux - justfluxes ) / justfluxes = "
-                            #                 f"{( ltcvfluxes - justfluxes ) / justfluxes}\n"
-                            #                 f"  ( thisltcv.fluxerr - justfluxerrs ) / justfluxerrs = "
-                            #                 f"{( ltcvfluxerrs - justfluxerrs ) / justfluxerrs}\n"
-                            #                 f"( sn[w] - ltcvfluxes[w]/ltcvfluxerrs[w] ) = "
-                            #                 f"{sn[w] - ltcvfluxes[w]/ltcvfluxerrs[w]}\n"
-                            #                 f"sn[w] = {sn[w]}\n" )
-                            # ****
-
-                            srcra = srcra[w]
-                            srcdec = srcdec[w]
-                            weight = sn[w] ** 2
-                            meanra = ( srcra * weight ).sum() / ( weight.sum() )
-                            meandec = ( srcdec * weight ).sum() / ( weight.sum() )
-                            raerr = np.sqrt( ( weight * ( srcra - meanra )**2 ).sum() / weight.sum() )
-                            decerr = np.sqrt( ( weight * ( srcdec - meandec )**2 ).sum() / weight.sum() )
-                            ra_dec_cov = ( weight * ( srcra - meanra ) * ( srcdec - meandec ) ).sum() / weight.sum()
-
-                            if ( pos is None ) or always_use_weighted_source_positions:
-                                if pos is not None:
-                                    # In this case, the position should *not* match the
-                                    #   diaobject_position value too closely
-                                    assert not infos['ra'][dex] != pytest.approx( pos.ra, abs=0.01/3600. )
-                                    assert not infos['dec'][dex] != pytest.approx( pos.dec, abs=0.01/3600. )
-                                # But should be good within numerical precision to the calculated positions (modulo
-                                # order of operations and floating roundoff).  (And, in fact, I might be
-                                # surprised that it's this good, cause the weights come from fluxes which are
-                                # stored as 32-bit floats.  Order of operations here and in the main code
-                                # may just be close enough...?)  (Or, just a whole lot of luck that
-                                # things worked out that way, except for once?)
-                                #
-                                # ....*if* there were enough sources to calculate a position from!
-                                if len(srcra) > 0:
-                                    assert infos['ra'][dex] == pytest.approx( meanra, rel=1e-12 )
-                                    assert infos['dec'][dex] == pytest.approx( meandec, rel=1e-12 )
-                                    assert infos['raerr'][dex] == pytest.approx( raerr, rel=1e-6 )
-                                    assert infos['decerr'][dex] == pytest.approx( decerr, rel=1e-6 )
-                                    # Fixture didn't put any correlations in
-                                    assert infos['ra_dec_cov'][dex] == pytest.approx( ra_dec_cov, abs=0.0001/3600. )
-                                else:
-                                    assert all( infos[i][dex] is None
-                                                for i in ( 'ra', 'dec', 'raerr', 'decerr', 'ra_dec_cov' ) )
     return check_ltcv_res
+
+
+# ======================================================================
+# These next few fixtures are used in both test_ltcv.py and
+# webserver/test.server.py (which is why they are here and not just in
+# one file).
+
+@pytest.fixture( scope='module' )
+def objstats_realtime_view( procver_collection ):
+    try:
+        ltcv.create_object_stats_materialized_view( 'realtime' )
+        yield True
+    finally:
+        with DBCon() as con:
+            con.execute_nofetch( "DROP MATERIALIZED VIEW IF EXISTS objstatscomb_realtime" )
+            con.execute_nofetch( "DROP MATERIALIZED VIEW IF EXISTS objstats_realtime" )
+            con.commit()
+
+
+@pytest.fixture( scope="module" )
+def objstats_pvc_pv2_view( procver_collection, set_of_lightcurves ):
+    try:
+        ltcv.create_object_stats_materialized_view( 'pvc_pv2' )
+        yield True
+    finally:
+        with DBCon() as con:
+            con.execute_nofetch( "DROP MATERIALIZED VIEW IF EXISTS objstatscomb_pvc_pv2" )
+            con.execute_nofetch( "DROP MATERIALIZED VIEW IF EXISTS objstats_pvc_pv2" )
+            con.commit()
+
+
+@pytest.fixture( scope="module" )
+def objstats_pvc_pv3_view( procver_collection, set_of_lightcurves ):
+    try:
+        ltcv.create_object_stats_materialized_view( 'pvc_pv3' )
+        yield True
+    finally:
+        with DBCon() as con:
+            con.execute_nofetch( "DROP MATERIALIZED VIEW IF EXISTS objstatscomb_pvc_pv3" )
+            con.execute_nofetch( "DROP MATERIALIZED VIEW IF EXISTS objstats_pvc_pv3" )
+            con.commit()
+
+
+@pytest.fixture( scope='module' )
+def accumulate_expected_stats( set_of_lightcurves, procver_collection ):
+    def do_the_things( procver, band=None ):
+        bpvs, pvs, pvinfo = procver_collection
+        roots = set_of_lightcurves
+
+        pvrow = [ p for p in pvinfo if ( ( p['procver'].description == procver ) or
+                                         ( procver in pvs and p['procver'].description == pvs[procver].description ) or
+                                         ( isinstance(procver, ProcessingVersion) and
+                                           procver.id==p['procver'].id ) ) ]
+        assert len(pvrow) == 1
+        pvrow = pvrow[0]
+
+        expected = {}
+
+        for root in roots:
+            thisexp = { 'rootid': [ root['root'].id, None, None ],
+                        'ra': [ root['root'].ra, None, 1e-10 ],
+                        'dec': [ root['root'].dec, None, 1e-10 ]
+                       }
+            if band is not None:
+                thisexp['band'] = [ band, None, None ]
+
+            for n in [ 'firstdet', 'lastdet', 'lastforced', 'maxdet' ]:
+                thisexp[ f'{n}_mjd' ] = [ 1e32 if n=='firstdet' else -1e32, 0.0001, None ]
+                thisexp[ f'{n}_flux' ] = [ -1e32, None, 1e-6 ]
+                thisexp[ f'{n}_fluxerr' ] = [ None, None, 1e-6 ]
+                if band is None:
+                    thisexp[ f'{n}_band'] = [ None, None, None ]
+            thisexp[ 'ndets' ] = [ 0, None, None ]
+            thisexp[ 'nfrc' ] = [ 0, None, None ]
+
+            for mag in [ 21, 22, 23, 24 ]:
+                thisexp[ f'ndets{mag}' ] = [ 0, None, None ]
+            for sn in [ 5, 7, 10 ]:
+                thisexp[ f'nsn{sn}' ] = [ 0, None, None ]
+            for rcut in [ 50, 60, 70, 80, 90, 95 ]:
+                thisexp[ f'nrelgtp{rcut}' ] = [ 0, None, None ]
+
+            # There are multiple base processing versions that have data.  We need to
+            #  extract the highest priority for each.  To do this, rewrangle
+            #  the set_of_lightcurves data so that it's indexed by base_procver,
+            #  in descending priority order
+
+            if band is not None:
+                cond = lambda s: s.band == band
+            else:
+                cond = lambda s: True
+
+            src_bpvkeys = [ p[2] for p in pvrow['diasource'] ]
+            frc_bpvkeys = [ p[2] for p in pvrow['diaforcedsource'] ]
+            reindexed_srces = { k: { s.visit: s for s in root['src'][k] if cond(s) }
+                                for k in src_bpvkeys if k in root['src'].keys() }
+            reindexed_srcextras = { k: { s.visit: se for s, se in zip(root['src'][k], root['srcex'][k]) if cond(s) }
+                                    for k in src_bpvkeys if k in root['src'].keys() }
+            reindexed_frced = { k: { f.visit: f for f in root['frc'][k] if cond(f) }
+                                for k in frc_bpvkeys if k in root['frc'].keys() }
+
+            # Extract the expected source values for this root object
+            seenvisits = set()
+            for bpv in reindexed_srces.keys():
+                srces = reindexed_srces[ bpv ]
+                srcextras = reindexed_srcextras[ bpv ]
+                for visit in srces.keys():
+                    src = srces[ visit ]
+                    srcex = srcextras[ visit ]
+                    if visit in seenvisits:
+                        # already have a higher prio bpv
+                        continue
+
+                    seenvisits.add( visit )
+                    thisexp['ndets'][0] += 1
+
+                    if src.midpointmjdtai < thisexp['firstdet_mjd'][0]:
+                        thisexp['firstdet_mjd'][0] = src.midpointmjdtai
+                        if band is None:
+                            thisexp['firstdet_band'][0] = src.band
+                        thisexp['firstdet_flux'][0] = src.psfflux
+                        thisexp['firstdet_fluxerr'][0] = src.psffluxerr
+                    if src.midpointmjdtai > thisexp['lastdet_mjd'][0]:
+                        thisexp['lastdet_mjd'][0] = src.midpointmjdtai
+                        if band is None:
+                            thisexp['lastdet_band'][0] = src.band
+                        thisexp['lastdet_flux'][0] = src.psfflux
+                        thisexp['lastdet_fluxerr'][0] = src.psffluxerr
+                    if src.psfflux > thisexp['maxdet_flux'][0]:
+                        thisexp['maxdet_mjd'][0] = src.midpointmjdtai
+                        if band is None:
+                            thisexp['maxdet_band'][0] = src.band
+                        thisexp['maxdet_flux'][0] = src.psfflux
+                        thisexp['maxdet_fluxerr'][0] = src.psffluxerr
+
+                    # For zeropoint = 31.4,
+                    #   m = 24 : f =   912
+                    #   m = 23 : f =  2291
+                    #   m = 22 : f =  5754
+                    #   m = 21 : f = 14454
+                    for mag, flux in zip( [ 24, 23, 22, 21 ], [ 912, 2291, 5754, 14454 ] ):
+                        if src.psfflux >= flux:
+                            thisexp[ f'ndets{mag}' ][0] += 1
+                    for sn in [ 5, 7, 10 ]:
+                        if ( src.psfflux / src.psffluxerr ) >= sn:
+                            thisexp[ f'nsn{sn}' ][0] += 1
+                    for rel in [ 50, 60, 70, 80, 90, 95 ]:
+                        if ( srcex is not None ) and ( srcex.reliability > rel / 100. ):
+                            thisexp[ f'nrelgtp{rel}' ][0] += 1
+
+            # Extract the expected forced source values for this root object
+            seenvisits = set()
+            for bpv, frces in reindexed_frced.items():
+                for visit, frc in frces.items():
+                    if visit in seenvisits:
+                        # already have a higher prio bpv
+                        continue
+                    seenvisits.add( visit )
+                    thisexp['nfrc'][0] += 1
+                    if frc.midpointmjdtai > thisexp['lastforced_mjd'][0]:
+                        thisexp['lastforced_mjd'][0] = frc.midpointmjdtai
+                        if band is None:
+                            thisexp['lastforced_band'][0] = frc.band
+                        thisexp['lastforced_flux'][0] = frc.psfflux
+                        thisexp['lastforced_fluxerr'][0] = frc.psffluxerr
+
+            expected[ root['root'].id ] = thisexp
+
+        return expected
+
+    return do_the_things
+
+
+@pytest.fixture( scope='module' )
+def check_db_rows_vs_expected( set_of_lightcurves, accumulate_expected_stats ):
+    roots = set_of_lightcurves
+
+    def do_the_things( rows, combrows, expected_roots=None, procver='realtime' ):
+        nonlocal roots
+
+        # Make sure what we got matches what we should expect from set_of_lightcurves.
+        # This involves arduously trolling through set_of_lightcurves to figure out what we expect.
+        # Objects 0 through 2 are in realtime, and all have detections in r and i
+        if expected_roots is not None:
+            assert len(rows) == len( expected_roots ) * 2
+            assert len(combrows) == len( expected_roots )
+        else:
+            assert len(rows) == 8
+            assert len(combrows) == 4
+
+        expected = { 'r': accumulate_expected_stats( procver, 'r' ),
+                     'i': accumulate_expected_stats( procver, 'i' ) }
+        exptot = accumulate_expected_stats( procver )
+
+        for rootid in exptot.keys():
+            for band in 'r', 'i':
+                thisexp = expected[ band ][ rootid ]
+                row = None
+                for checkrow in rows:
+                    if ( checkrow['rootid'] == rootid ) and ( checkrow['band'] == band ):
+                        if row is not None:
+                            raise RuntimeError( f"{row['rootid']}, {row['band']} shows up more than once!" )
+                        row = checkrow
+
+                if row is None:
+                    if expected_roots is None:
+                        assert False, f"Didn't get a result for {rootid} band {band}"
+                    else:
+                        assert rootid not in set( roots[i]['root'].id for i in expected_roots )
+                else:
+                    assert set( row.keys() ) == set( thisexp.keys() )
+                    for key in row.keys():
+                        if thisexp[key][1] is not None:
+                            assert row[key] == pytest.approx( thisexp[key][0], abs=thisexp[key][1] )
+                        elif thisexp[key][2] is not None:
+                            assert row[key] == pytest.approx( thisexp[key][0], rel=thisexp[key][2] )
+                        else:
+                            assert row[key] == thisexp[key][0]
+
+            combexp = exptot[ rootid ]
+            row = None
+            for checkrow in combrows:
+                if checkrow['rootid'] == rootid:
+                    if row is not None:
+                        raise RuntimeError( f"{row['rootid']} shows up more than once!" )
+                    row = checkrow
+
+            if row is None:
+                if expected_roots is None:
+                    assert False, f"Didn't get a result for {rootid}"
+                else:
+                    assert rootid not in set( roots[i]['root'].id for i in expected_roots )
+            else:
+                assert set( row.keys() ) == set( combexp.keys() )
+                for key in row.keys():
+                    if combexp[key][1] is not None:
+                        assert row[key] == pytest.approx( combexp[key][0], abs=combexp[key][1] )
+                    elif combexp[key][2] is not None:
+                        assert row[key] == pytest.approx( combexp[key][0], rel=combexp[key][2] )
+                    else:
+                        assert row[key] == combexp[key][0]
+
+    return do_the_things
+
+
+@pytest.fixture( scope='module' )
+def check_search_vs_expected( set_of_lightcurves, accumulate_expected_stats ):
+    roots = set_of_lightcurves
+
+    def do_the_things( procver, expected_roots, band, results ):
+        nonlocal roots
+
+        expected_rootids = set( roots[i]['root'].id for i in expected_roots )
+        expected = accumulate_expected_stats( procver, band )
+        expected = { k: v for k, v in expected.items() if k in expected_rootids }
+
+        if ( len(results['rootid']) == 0 ) and ( len(expected) != 0 ):
+            assert False, "No results, should have been some"
+
+        rootsareuuid = isinstance( results['rootid'][0], uuid.UUID )
+
+        if rootsareuuid:
+            assert set( results['rootid'] ) == expected_rootids
+        else:
+            assert set( uuid.UUID(r) for r in results['rootid'] ) == expected_rootids
+
+        for i, rootid in enumerate( results['rootid'] ):
+            if not rootsareuuid:
+                rootid = uuid.UUID( rootid )
+            for k, shouldbe in expected[rootid].items():
+                val = results[k][i]
+                if ( k == 'rootid' ) and ( not rootsareuuid ):
+                    val = uuid.UUID( val )
+                if shouldbe[1] is not None:
+                    assert val == pytest.approx( shouldbe[0], abs=shouldbe[1] )
+                elif shouldbe[2] is not None:
+                    assert val == pytest.approx( shouldbe[0], rel=shouldbe[2] )
+                else:
+                    assert val == shouldbe[0]
+
+    return do_the_things

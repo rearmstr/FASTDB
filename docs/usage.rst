@@ -5,6 +5,7 @@ Using FASTDB
 ============
 
 .. contents::
+   :local:
 
 This documentation is for people who want to *use* FASTDB.  There is a FASTDB server installed somewhere that you wish to connect to in order to pull date from or push data to.  Since FASTDB is currently under heavy development, there is no global production server.  As such, if you are working with an instance of FASTDB for your own development, probably Rob set that up for you and you already know where it is.  Alternatively, you might set up a local test environment (see :ref:`developers-docs`) to use to develop code on your own machine.
 
@@ -15,10 +16,13 @@ Access to FASTDB is designed to be entirely through a web API.  By design, the u
 The FASTDB Client
 =================
 
-While you can access the FASTDB web API using any standard way of accessing web APIs (e.g. the python ``requests`` module), there is a FASTDB client designed to make this a little bit easier.
+While you can access the FASTDB web API using any standard way of accessing web APIs (e.g. the python ``requests`` module), there is a FASTDB client designed to make this a little bit easier.  It does two things for you.  First, it handles the authentication loop, and required subequent headers on requests, which would be somewhat painful for you to do yourself.  Second, it has a "retry on fail" function, so that when you try to post to something, if the connect fails, it will retry a few times before actually raisinig an exception.
 
 Getting Set Up to Use the FASTDB Client
-----------------------------------------
+---------------------------------------
+
+On Places Other Than NERSC
+**************************
 
 The FASTDB client is entirely contained in the file ``client/fastdb_client.py`` in the GitHub checkout.  You can just refer to this directly in your checkout by adding something to your `PYTHONPATH`, or you can copy it somewhere.  (**Warning**: if you copy it somewhere, then be aware that eventually stuff might break as your copied version falls out of date!)
 
@@ -36,16 +40,16 @@ To run the FASTDB client on Perlmutter, you need to do the following *once*:
 
   * Get an account on FASTDB.  Talk to Rob; he will need your name, email address, and the username you want on FASTDB.
 
-  * Go to https://desc-fastdb.lbl.gov and click on "Request Password Reset".  Follow the prompts.  Make sure to use a good password, that is not the same as a password you use anywhere else.  If you're still using the same password for more than one account, and indeed if you're not using a password manager like KeePassXC or LastPass, then you are at least a decade behind on what you really need to be doing with your passwords.
-  
+  * Go to https://desc-fastdb.lbl.gov and click on "Request Password Reset".  Follow the prompts.  Make sure to use a good password, that is not the same as a password you use anywhere else.  If you're still using the same password for more than one account, and indeed if you're not using a password manager, then you are at least a decade behind on what you really need to be doing with your passwords.  (Rob uses and recommend `KeePassXC <https://keepassxc.org/>`_, but there are other good ones.)  (As a bonus, with some pain, you can get KeePassXC to serve up passkeys (this potentially good but in practice cumbersome new development in authentication), if you're anal like Rob and don't want to just rely on whatever is built into your browser.)
+
   * Create a file ``.fastdb.ini`` in your home directory on nersc.  Give it contents::
 
       [production]
       url = https://desc-fastdb.lbl.gov
       username = <your fastdb username>
-      pass = <your fastdb password>
+      password = <your fastdb password>
 
-  * Run ``chmod go-rws ~/.fastdb.ini`` to make sure nobody else can read your password.
+  * Run ``chmod go-rws ~/.fastdb.ini`` to make sure nobody else can read your password.  (Indeed, the FASTDB client will refuse to start if your ``.ini`` file is readable by anybody other than you.)
 
 Having done that, thereafter in order to use FASTDB from Perlmutter, each time you start a session you need to:
 
@@ -53,9 +57,7 @@ Having done that, thereafter in order to use FASTDB from Perlmutter, each time y
 
       source /global/cfs/cdirs/lsst/groups/TD/setup_td.sh
 
-  * Add the ``fastdb_client`` directory to your python path with::
-
-      export PYTHONPATH=/dvs_ro/cfs/cdirs/desc-td/SOFTWARE/fastdb_deployment/fastdb_client:$PYTHONPATH
+This environment includes the path that has the NERSC install of the fastdb client.
 
   * Run python::
 
@@ -107,6 +109,15 @@ Returns a list of known processing versions and processing version aliases.  You
 
 Because ``procvers`` includes both aliases and processing version names, some of the elements of the list actually refer to the same thing.  (For instance, if ``default`` is in the list, it's almost certainly an alias for something else that is also in the list.)
 
+Example::
+
+  >>> from pprint import pp
+  >>> result = fdb.post( "/getprocvers" )
+  >>> pp(result)
+  {'status': 'ok',
+   'procvers': ['default', 'pvc_pv1', 'pvc_pv2', 'pvc_pv3', 'realtime']}
+
+
 .. _webap-procver:
 
 ``/procver``
@@ -131,13 +142,35 @@ You can pass either a processing version or a processing version alias in ``<pro
 ``/baseprocver``
 ****************
 
-Hit this API endpoint with ``/baseprocver/<procver>/<table>``, where ``<procver>`` is either the name or the UUID (as a string) of the base processing version you want information about; if this is a UUID, then you should omit the ``/<table>``, but if it's a string, then ``<table>`` should be one of ``diaobject``, ``diasource``, or ``diaforcedsource``.  You will get back a JSON dictionary with keys:
+Hit this API endpoint with ``/baseprocver/<procver>/<table>``, where ``<procver>`` is either the name or the UUID (as a string) of the base processing version you want information about; if this is a UUID, then you should omit the ``/<table>``, but if it's a string, then ``<table>`` is the name of the table you want this the base processing version for.  (Possible tables include ``diaobject``, ``diasource``, ``diaforcedsource``, ``diaobject_position``, ``host_galaxy``.)   You wil get back a JSON dictionary with keys:
 
 * ``status`` : string, value ``ok``
 * ``id`` : string UUID, the UUID of the base processing version
 * ``description`` : string, the name of the base processing version
 * ``table`` : the table that this is a base processing version for
 * ``procvers`` : list of string, names of processing versions that include this base processing version.  (Normally, I'd expect this to be at most a single-element list, but you never know.)
+
+
+.. _webap_flagsdefinitions:
+
+``/flagsdefinitions``
+*********************
+
+This api endpoint returns a dictionary:
+
+.. code-block:: python
+
+   { 'flags': [ list of { 'mask': int, 'definition': str  } ],
+     'flags_inverse': { dict of definition : { 'mask': int, 'bit': int } }
+     'pixelflags': [ list of { 'mask': int, 'definition': str } ],
+     'pixelflags_inverse': { dict of definition : { 'mask': int, 'bit': int } }
+   }
+
+Use this to interpret the ``flags`` and ``pixelflags`` columns from
+:ref:`ltcv-getmanyltcvs` and :ref:`ltcv-getltcv`.  Above, the value of
+mask is always ``2^bit``; for the lists, bit is the index of the list.
+The value of description corresponds to the name of a boolean field on
+LSST schema.
 
 
 .. _webap-count:
@@ -169,12 +202,20 @@ Because of the table joins necessary to handle processing versions, this can act
 
 Call this with one of:
 
+  * ``/getdiaobjectinfo``
+  * ``/getdiaobjectinfo/procver``
   * ``/getdiaobjectinfo/objid``
   * ``/getdiaobjectinfo/procver/objid``
 
 Where procver is the processing version; it can either be the database's UUID, or the human-readable processing version, or an alias for the processing version.  If not given, it assumes "default".  ``objid`` is either the rootid, or the diaobjectid, of the object you want information for.
 
-You can include in the ``json=`` dictionary a single parameter, ``columns``, which is a list of the columns you want back.  (The query *may* be slightly faster if you don't ask for any position information, but realistically it should be pretty fast in either case.)
+(If there is only a single argument after ``/getdiaobjectinfo``, it is interpreted as an objectid if the json dictionary does *not* include ``objectids`` (see below), otherwise its interpreted as a processing version.)
+
+You can also include information in the ``json=`` dictionary.  Options include:
+
+  * ``processing_version`` : You can specify this here instead of in the URL.  Usually it's probably easier to just put the processing version in the URL.  You'll get an exception if you do both and they don't match.
+  * ``objectids`` : A list of object ids, either integer ``diaobjectid`` values, or ``rootid`` values.
+  * ``columns`` : A list of columns you want back.  (The query *may* be slightly faster if you don't ask for any position information, but realistically it should be pretty fast in either case.)
 
 You get back a dictionary.  Each key of the dictionary is a string, the name of the column, and each the value of each element of the dictionary is a list, the values for that column; each list will have the same length.  There may be more than one value in each list because FASTDB will return information on each diaobject that shares the same rootid in the processing version you've queried.  Returned columns include:
 
@@ -187,8 +228,10 @@ You get back a dictionary.  Each key of the dictionary is a string, the name of 
   * ``raerr`` : uncertainty on ra, as reported by LSST
   * ``decerr`` : uncertainty on dec, as reported by LSST
   * ``ra_dec_cov`` : covariance between ra and dec, as reported by LSST
-  
-    
+
+**If you get empty lists and you really didn't expect to:** Probably the ``diaobject`` you were asking for does not exist in the processing version you specified.  Processing versions are complicated.
+
+
 .. _webap-objectsearch:
 
 ``/objectsearch``
@@ -209,11 +252,11 @@ Search criteria are passed as a JSON-encoded dictionary in the body of the POST.
 * ``fall_back_to_root_position`` : bool, default True; documentation TBD
 
 * ``only_use_rootposition``: bool, default False; documentation TBD
-  
+
 * ``just_objids`` : bool.  If True, you don't get back lightcurves, you just get back object ids.  If this is True, and ``min_lastmag`` and ``max_lastmag`` are not specified, then the object search will be somewhat faster.
 
 * ``noforced`` : bool.  Normally, you will get back the last forced photometry point for each object (see below).  If ``noforced`` is True, then you will not get that back.  This can make the search faster.  Ignored if either ``min_lastmag`` or ``max_lastmag`` are True.
-  
+
 * ``mjd_now`` : float.  Normally, the search will look through all photometry when trying to find objects that match your specified criteria.  If you pass a value here, it will only look at photometry taken at this MJD or earlier.  Use this for tests and simulations when you want to pretend that the current date is different from the real current date.
 
 * ``ra``, ``dec`` : floats.  The RA and Dec, in decimal degrees, for the center of a cone search.  If you pass these, both are required, and ``radius`` is also required.
@@ -249,7 +292,7 @@ Search criteria are passed as a JSON-encoded dictionary in the body of the POST.
 * ``maxmag_maxdetection`` : float.  The brightest detection must be no dimmer than this.  This is often the one you will want to use to throw out too-dim objects.
 
 * ``min_numdetections`` : int.  Objects must have at least many detections.  (I.e. diasources.  They may well, and probably do, have more forced photometry points than this.)
-  
+
 * ``mindt_firstlastdetection`` : float.  The time between the first and last *detections* must be at least this many days.
 
 * ``maxdt_firstlastdetection`` : float.  The time between the first and last *detections* must be at most this many days.  Be careful with this.  If you're trying to find stuff whose lightcurve only lasts a week, and a cosmic ray hit the objects' host galaxy a year later, and somehow that cosmic ray didn't get properly filtered out, then the ``dt`` between the first and last detections will be a year.
@@ -287,6 +330,100 @@ You get back a dictionary-encoded table of data.  Each key of the dictionary is 
 The ``...forced...`` columns will not be included if ``noforced`` is passed as True, and if neither ``min_lastmag`` or ``max_lastmag`` are given.  Note that it's possible that the latest detection will be *later* than the last forced-photometry measurement.  (This will often be true in the ``realtime`` processing version, as the most recent detections will not yet have corresponding forced-photometry yet performed.)
 
 
+.. _webap-gettag:
+
+* ``/gettag/<tag>``
+
+where ``<tag>`` is replaced by the tag you're interested in (either the name or the uuid).  It just returns a dictionary with:
+
+.. code-block:: python
+
+   { 'status': 'ok',
+     'id': '<tag uuid>'
+     'tag': '<tag>',
+     'description': '<description of tag>'
+   }
+
+The value of ``description`` might be ``None``.  It will return an error if ``<tag>`` doesn't exist.
+
+
+.. _webap-tagsforobject:
+
+* ``/tagsforobject/<obj>``
+
+Call this with:
+
+.. code-block:: python
+
+   result = fdb.post( "/tagsforobject/<obj>" )
+
+where ``<obj>`` is either the rootid or diaobjectid of the object whose tags you want.  If the object is found, then result will be:
+
+.. code-block:: python
+
+   { 'rootid': <root diaobject uuid>,
+     'tags': <list of tags>
+   }
+
+If the list of tags is empty, it means this object is not associated with any tags.
+
+
+.. _webap-objectsfortag:
+
+* ``/objectsfortag/<tag>``
+
+Replace ``<tag>`` with either the tag name, or the tag uuid.  If the tag exists, you will get back:
+
+.. code-block:: python
+
+   { 'tagid': <tag uuid>,
+     'tag': <tag name>,
+     'rootids': <list of uuids>
+   }
+
+Where the list of uuids are the root diabojects associated with this tag.  An empty list means no objects are associated with this tag.
+
+
+.. _webap-createtag:
+
+* ``/createtag/<tag>``
+
+This creates a new tag with name ``<tag>``.  It will raise an exception if the tag already exists.  **Only people in the create_tag group (which is very few people on the production DESC FASTDB) can run this.**
+
+You can optionally include a description that will be saved with the tag by passing a dictionary with key ``"description"`` as the json payload, e.g.:
+
+.. code-block:: python
+
+   result = fdb.post( "/createtag/important_tag", { 'description': 'This is an important tag.' } )
+
+.. _webap-tagobjects:
+
+* ``/tagobjects/<tag>``
+
+Tags a specified list of diaobjects with tag ``<tag>``.  **Only people in the create_tag group can run this.** Call it with:
+
+.. code-block:: python
+
+   result = fdb.post( "/tagobjects/<tag>", { 'objects': list_of_objects } )
+
+substituting ``<tag>`` with the tag name you want to tag the objects with.  ``list_of_objects`` may be a list of string uuids (actual python ``uuid.UUID`` objects should probably work too?  Try it!), in which case you're specifyting the root ids of the objects (recommended).  Alternatively, it can be a list of integers; in this case, you are specifiying diaboejctids, and you must include a second key in the dictionary, ``"ids_are_diaobjectid"``, with value ``True``.
+
+There is no error if any objects are already tagged with the requested tag; that will just make your call (partially) a null-op.
+
+.. _webap-untagobjects:
+
+* ``/untagobjects/<tag>``
+
+Remove tags from objects.  Calling semantics (and restrictions on who can do it) are the same as for ``/tagobjects``, with one modification.  If any objects you're trying to untag are *not* tagged with the ``<tag>``, you'll get an error return.  If you include a key ``"missing_ok"`` with value ``True`` in the passed dictionary, then there will be no error, and the untagging of all objects that actually have the tag will proceed.
+
+(Oh, and one other thing.  This won't actually work unless you *also* include a key ``"I know what I am doing"`` in the parameter dictionary, with value ``True``.  Think of this as an "are you sure?".)
+
+.. _webap-deletetag:
+
+* ``/deletetag/<tag>``
+
+This removes tag ``<tag>``.  It will also (obviously?) remove all assocations between diaobjects and ``<tag>``.  Only people in the create_tag group can run this, and you must pass as the second argument (or as the ``json=`` argument) a dictionary with key ``"I know what I am doing"`` and value ``True``.
+
 
 Lightcurve Endpoints
 --------------------
@@ -315,22 +452,30 @@ In addition, there are several optional keys that control what's included:
 
 * ``mjd_now`` : float.  Normally, you will get back all relevant photometry.  For normal usage, that means photometry from before the current time, because the future hasn't happened yet.  If you specify this value, you only get back photometry from this MJD or earlier.  Use this during tests and simulations.
 
+* ``nonevalue`` : TBD
+
 * ``return_object_info`` : See below
 
 * ``include_object_positions`` : TBD
 
 * ``position_processing_version`` : TBD
-  
+
 * ``include_base_procver`` : TBD
 
 * ``include_source_positions`` : TBD
+
+* ``include_reliability`` : TBD
+
+* ``include_bitflags`` : TBD
+
+* ``flags_nonevalue`` : TBD
 
 * ``use_weighted_source_positions`` : TBD
 
 * ``always_use_weighted_source_positions`` : TBD
 
 
-What you get depends on whether you included ``return_object_info``.  If you included that with a value of 1, then the return will be a dictionary: ``{'ltcvs': ltcvs, 'objinfo': objinfo}``.  If you didn't include that, then you just get back ``ltcvs``..
+What you get depends on whether you included ``return_object_info``.  If you included that with a value of 1, then the return will be a dictionary: ``{'ltcvs': ltcvs, 'objinfo': objinfo}``.  If you didn't include that, then you just get back ``ltcvs``.
 
 ``ltcvs`` is a list that's a little bit complicated.  Each row of ``ltcvs`` is a dictionary, and corresponds to the lightcurve for a single diaobject.  It has one key ``rootid`` that is the root diaobject id for the object; this is an internal FASTDB id that tries to deduplicate redundant diaobjectids that came from LSST.  The remaining keys can be thought of as column names, and the values are lists that can be thought of as the contents of those columns.  The columns include:
 
@@ -345,6 +490,9 @@ What you get depends on whether you included ``return_object_info``.  If you inc
   * ``fluxerr`` : float, the uncertainty on flux
   * ``isdet`` : int: 1 if this was detected (i.e. a diaSource exists), 0 if not
   * [ ``ispatch`` : see below ; only included you passed ``which`` as ``patch`` (the default) ]
+  * [ ``reliability`` : the reliability of the source if available, otherwise nonevalue.  Only included if you specified ``include_reliability`` ]
+  * [ ``flags`` : the flags if available, otherwise nonevalue.  Only included if you specified ``include_bitflags`` ]
+  * [ ``pixelflags`` : the pixelflags if available, otherwise nonevalue.  Only included if you specified ``include_bitflags`` ]
   * [ ``base_procver_s`` : TBD; only included if you set ``include_base_procver`` ]
   * [ ``base_procver_f`` : TBD; only included if you set ``includebase_procver`` and ``which`` wasn't ``detections`` ]
   * [ ``det_ra`` : the RA where this source was detected by LSST on the difference image.  Only included if you specified ``include_source_positions`` ]
@@ -381,7 +529,7 @@ Get the lightcurve of a single object.  Hit this with one of:
 * ``/ltcv/getltcv/<objid>``
 * ``/ltcv/getltcv/<procver>/<objid>``
 
-``<objid>`` is either the integer ``diaobjectid`` or string (uuid) ``rootid`` of the object whose lightcurve you want.  **Warning**: there are subtleties around ``diaobjectid`` and processing versions.  Be careful!  It's often safer to specify root ids.
+``<objid>`` is either the integer ``diaobjectid`` or string (uuid) ``rootid`` of the object whose lightcurve you want.  **Warning**: there are subtleties around ``diaobjectid`` and processing versions.  Be careful!  It's often safer to always psecify ``<procver>`` and give a root id, because it's more obvious what you get back in that case.  (I.e., the photometry from that processing version for that object.)
 
 ``<procver>`` is the processing version of the photometry to fetch.  If not given, it will assume ``default``.
 
@@ -398,7 +546,7 @@ What you get back is the same as what you get back from :ref:`ltcv-getmanyltcvs`
 * ``/ltcv/getrandomltcv/<procver>``
 
 **WARNING**: This one is scary and ill-defined and probably doesn't even work right now.
-  
+
 Randomly choose an object from the given processing version (using "default" if one is not specified) and return its lightcurve.  Format of the return is the same as for ``ltcv/getltcv``.  You can optionally pass a JSON dictionary in the POST body with parameters from ``bands``, ``which``, and ``mjd_now``, just as in ``ltcv/getltcv``.
 
 
@@ -495,11 +643,11 @@ POST to the endpoint with dictionary in a JSON payload.  This may be an empty di
 * ``requested_since`` : string in the format ``YYYY-MM-DD`` or ``YYYY-MM-DD hh:mm:ss``; only find spectra that were requested since this time.  (This is so you can filter out old requests.)  You will usually want to specify this.  If you don't, it will give you anything that anybody has asked for ever.
 
 * ``requester`` : string; if given, only get spectra requested by a specific requester.  If not given, get all spectra requested by everybody.
-  
+
 * ``not_claimed_in_last_days`` : int; only return spectra where nobody else has indicated a intention to take this spectrum.  Use this to coordinate between facilities, so that multiple facilities don't all get the same spectra.  This defaults to 7 if not specified.  If you don't want to consider whether anybody else has said they're going to take a spectrum, explicitly pass ``None`` for this value.
 
 * ``no_spectra_in_last_days``: int; only return objects that have not had spectrum information reported in this many days.  This is also for coordination.  If you don't want to consider just what is planned, but what somebody actually claims to have observed, then use this.  If not given, it defaults to 7.  (This may be combined with ``not_claimed_in_last_days``.  It's entirely possible that people will report spectra that they have not claimed.)  To disable consideration of existing spectra, as with ``not_claimed_in_last_days`` set this parameter to ``None``.
-  
+
 * ``detected_since_mjd`` : float.  Only return objects that have been *detected* (i.e. found as a source in DIA scanning) by Rubin since this MJD.  Be aware that an object may not have been detected in the last few days simply because it's field hasn't been observed!  If not passed, then the server will use ``detected_in_last_days`` (below) instead.  Pass ``None`` to explicitly disable consideration of recent detections.
 
 * ``detected_in_last_days``: float.  Only return objects that have been *detected* within this may previous days by LSST DIA.  Ignored if ``detected_since_mjd`` is specified.  If neither this nor ``detected_since_mjd`` is given, defaults to 14.
@@ -507,9 +655,9 @@ POST to the endpoint with dictionary in a JSON payload.  This may be an empty di
 * ``lim_mag`` : float; a limiting magnitude; make sure that the last measurement or detection was at most this magnitude.
 
 * ``lim_mag_band`` : str; one of u, g, r, i, z, or Y.  The band of ``lim_mag``.  If not given, will just look at the latest observation without regard to band.
-  
+
 * ``mjd_now`` : float; pretend that the current MJD is this date.  Normally, the server will use the current time, and normally this is what you want.  This parameter is here for testing purposes.  All database queries will cut off things that are later in time than this time.
-  
+
 You will get back a JSON-encoded list.  Each element of the list is a dictionary with keys:
 
 * ``root_diaobject_id``: a (string) UUID, the root diaobject id of the object whose spectrum is wanted.
@@ -579,7 +727,7 @@ POST to the api endpoint with a JSON payload that is a dict, with keys:
 * ``z``: float;  the redshift of the supernova from the spectrum. Leave this blank ("" or None) if it cannot be determined.
 
 * ``classid``: int — the type from the spectrum. Use the `ELAsTiCC/DESC taxonomy <https://github.com/LSSTDESC/elasticc/blob/main/taxonomy/taxonomy.ipynb>`_.
-  
+
 
 ``spectrum/getknownspectruminfo``
 **********************************
@@ -615,7 +763,7 @@ If all is well, the response you get back is a JSON-encoded list (which might be
 * ``facility``: string; the facility that reported the spectrum
 
 * ``inserted_at``: datetime; the time at which the spectrum was reported to the database
-  
+
 * ``mjd``: float, the MJD the spectrum was taken
 
 * ``z``: float or None, the redshift from the spectrum.  If None, it means that the redshift wasn't able to be determined from the spectrum.
@@ -632,3 +780,88 @@ Direct SQL Queries
 The FASTDB web interface includes a front-end for direct read-only SQL queries to the backend PostgreSQL database.  (Note that "read-only" means that you can't commit changes to the database.  You *can* use temporary tables with this interface, and that is often a very useful thing to do.)
 
 TODO document this.  In the mean time, see the `examples FASTDB client Juypyter notebook <https://github.com/LSSTDESC/FASTDB/blob/main/examples/using_fastdb_client.ipynb>`_ for documentation on this interface.
+
+
+Filter descriptions
+===================
+
+This section described the filters, or topics, that are being ingested into FASTDB. This defines what types of alerts are ingested.
+
+Currently, there are three filters being ingested from Fink:
+
+1. :ref:`remove-unlikely-transients`
+2. :ref:`most-likely-sn`
+3. :ref:`uniform-sample`
+
+
+.. _remove-unlikely-transients:
+
+Removes objects unlikely to be transients of interest
+------------------------------------------------------
+
+**Broker:** `Fink <https://fink-broker.org/>`_
+
+**Filter name:** ``fink_remove_unlikely_transients_lsst``
+
+**Link to filter:** `remove_unlikely_transients <https://github.com/astrolabsoftware/fink-filters/blob/master/fink_filters/rubin/livestream/filter_remove_unlikely_transients/filter.py>`_
+
+The goal of this filter is to remove alerts unlikely to be transients of interest to the LSST DESC community, filtering only on LSST-provided parameters. Essentially, this filter aims to balance the goals of reducing the alert stream to something manageable by FASTDB and ensuring that all all alerts of interest are also passed on to FASTDB. As of May 2026, it returns ~20% of the incoming alerts. It does the following:
+
+- uses Fink's ``b_good_quality`` `function <https://github.com/astrolabsoftware/fink-filters/blob/e48a6cdba44645d294aa50409d7431bc9e7575b3/fink_filters/rubin/blocks.py#L372>`_, which filters out alerts with certain flags, those with negative flux, and those with SNR <= 6. As of June 2026, it filters out alerts with the following flags:
+
+  - ``isDipole``
+  - ``pixelFlags``
+  - ``pixelFlags_bad``
+  - ``pixelFlags_saturated``
+  - ``pixelFlags_streakCenter``
+  - ``pixelFlags_interpolated``
+  - ``pixelFlags_cr``
+  - ``pixelFlags_nodata``
+  - ``pixelFlags_streak``
+  - ``pixelFlags_edge``
+  - ``psfFlux_flag``
+  - ``apFlux_flag``
+  - ``forced_PsfFlux_flag``
+  - ``forced_PsfFlux_flag_edge``
+  - ``shape_flag``
+  - ``centroid_flag``
+
+- removes alerts with the flags: ``isNegative``
+- removes alerts that are identified as solar system objects by LSST
+- removes alerts with no previous detections
+- removes alerts with SNR <= 10
+
+.. _most-likely-sn:
+
+Most likely to be supernovae
+----------------------------
+
+**Broker:** `Fink <https://fink-broker.org/>`_
+
+**Filter name:** ``fink_most_likely_sn_lsst``
+
+**Link to filter:** `most_likely_sn <https://github.com/astrolabsoftware/fink-filters/blob/master/fink_filters/rubin/livestream/filter_most_likely_sn/filter.py>`_
+
+The goal of this filter is to return only alerts that are very likely to be supernovae, according to two of Fink's classifiers, the SuperNNova classifier and the CATS classifier (described in `Transient Classifiers for Fink: Benchmarks for LSST <https://arxiv.org/pdf/2404.08798>`_). As of May 2026, it returns less than 2% of the incoming alerts.
+
+**IMPORTANT NOTE:** This filter makes use of Fink's classifiers, and the specific model behind those classifiers may change over time, and in fact has changed since the creation of these filters. So to keep this filter working as intended, we recommend monitoring this filter and making adjustments as necessary to return the desired fraction of alerts.
+
+This filter does the following:
+
+- uses the same set of filters as described above to filter out any undesired alerts
+- filters out all alerts with a SuperNNova score less than 0.7
+- filters out all alerts that are not classified as Supernova-like (cats_class = 11) with the CATS classifier
+- filters out all alerts with a CATS score < 0.9
+
+.. _uniform-sample:
+
+Uniform sample
+--------------
+
+**Broker:** `Fink <https://fink-broker.org/>`_
+
+**Filter name:** ``fink_uniform_sample_lsst``
+
+**Link to filter:** `uniform_sample <https://github.com/astrolabsoftware/fink-filters/blob/master/fink_filters/rubin/livestream/filter_uniform_sample/filter.py>`_
+
+This filter selects 1% of all live alerts in a uniformly random way by returning all alerts where the ``diaSourceId`` is evenly divisible by 113.

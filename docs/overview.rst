@@ -1,9 +1,9 @@
-.. contents::
-
 ===============
 FASTDB Overview
 ===============
 
+.. contents::
+   :local:
 
 FASTDB runs with two database backends, a PostgreSQL server and a MongoDB server.  Neither database server is directly accessible; rather, you access FASTDB through a webserver.  As of this writing, a few instances of FASTDB exist; not all of them are running the latest version of the code....
 
@@ -34,6 +34,10 @@ There will be multiple ``diaobject`` entries for the same physical object on the
 The ``diabobject`` table is indexed (i.e. primary key) by its ``diaobjectid``.  We have been told by the project that these are guaranteed to be globally unique; that is, the same ``diaobjectid`` will not show up in two different releases.  (In fact, some of the bits of the number encode the release.)  The ``diasource`` and ``diaforcedsoure`` tables are indexed by a compound (``dia[forced]sourceid, base_procver_id``) key (see :ref:`processing-versions` below).
 
 There is nominally a ``host_galaxy`` table, but because LSST alerts do not currently include any host galaxy information, this is not fully implemented anywhere.
+
+The ``diasource`` and ``diaforcedsource`` tables have an "essential" subset of the information that are in the corresponding LSST alert schema.  (This is because we aren't sure that every broker will send us *all* of the information that are in those schema.)  There are associated tables, ``diasource_extra`` and ``diaforcedsource_extra``, that have the additional information; there may not be a row in thhe ``*_extra`` tables for any given source or forced source.
+
+There is a ``diasource_brokerinfo`` table that has more or more entries for each ``diasource`` that was the subject of an alert that we ingestest from a broker.  The primary key of this table is `(brokername,topic,diasourceid,base_procver_id)`.  (See below re: :ref:`processing-versions`.)  ``brokername`` tells us which broker we got an alert about this source from, and ``topic`` tells us the topic from that broker.  There will *not* be a ``diasource_brokerinfo`` entry for every ``diasource`` we know!  Many of the ``diasource`` entries will have been created because of the "previous sources" arrays that come in alert streams.  There will only be a ``diasource_brokerinfo`` entry if we got an alert for that particular source.
 
 All of the rows of the photometric tables have a processing version associated with them; see :ref:`processing-versions` below.  This makes things much more complicated.  Much.
 

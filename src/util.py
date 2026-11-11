@@ -1,10 +1,29 @@
-__all__ = [ "FDBLogger", "parse_bool", "env_as_bool", "asUUID", "isSequence",
-            "float_or_none_from_dict", "int_or_none_from_dict",
-            "datetime_or_none_from_dict_mjd_or_timestring", "mjd_or_none_from_dict_mjd_or_timestring",
-            "datetime_to_utc",
-            "parse_sexigesimal", "float_or_none_from_dict_float_or_dms", "float_or_none_from_dict_float_or_hms",
-             "mjd_from_mjd_or_datetime_or_timestring", "laboriously_construct_pandas",
-             "get_alert_schema", "procver_id" ]
+__all__ = [
+    "FDBLogger",
+    "allAreSequences",
+    "anyIsSequence",
+    "asUUID",
+    "base_procver_id",
+    "datetime_or_none_from_dict_mjd_or_timestring",
+    "datetime_to_utc",
+    "env_as_bool",
+    "fastdb_json_default",
+    "float_or_none_from_dict",
+    "float_or_none_from_dict_float_or_dms",
+    "float_or_none_from_dict_float_or_hms",
+    "get_alert_schema",
+    "int_or_none_from_dict",
+    "isSequence",
+    "laboriously_construct_pandas",
+    "listify",
+    "mjd_from_mjd_or_datetime_or_timestring",
+    "mjd_or_none_from_dict_mjd_or_timestring",
+    "pandas_to_list",
+    "parse_bool",
+    "parse_sexigesimal",
+    "procver_id",
+    "stringify_integers",
+]
 
 import sys
 import os
@@ -25,12 +44,12 @@ import fastavro
 import astropy.time
 import rkwebutil
 
-_fastdb_schema_namespace = 'fastdb.v10_0_0'
-_lsst_schema_namespace = 'lsst.v10_0'
+_fastdb_schema_namespace = 'fastdb.v11_1_0'
+_lsst_schema_namespace = 'lsst.v11_1'
 
 _default_datefmt = '%Y-%m-%d %H:%M:%S'
-# _default_log_level = logging.DEBUG
-_default_log_level = logging.INFO
+_default_log_level = logging.DEBUG
+# _default_log_level = logging.INFO
 # Normally you don't want to show milliseconds, because it's additional gratuitous information
 #  that makes log output lines longer.  But, if you're debugging timing stuff, you might want
 #  temporarily to set this to True.
@@ -193,6 +212,38 @@ class FDBLogger:
 
 # ======================================================================
 
+def fastdb_json_default( obj ):
+    if isinstance( obj, pandas.api.typing.NAType ):
+        return None
+    if isinstance( obj, uuid.UUID ):
+        return str(obj)
+    elif isinstance( obj, numbers.Integral ):
+        return int(obj)
+    elif isinstance( obj, numbers.Real ):
+        return float(obj)
+    elif isinstance( obj, np.ndarray ):
+        return obj.tolist()
+    else:
+        raise TypeError( f"Don't know how to handle {obj} (type {type(obj)}" )
+
+
+# ======================================================================
+
+def stringify_integers( obj ):
+    """"WHY???   So we can pass 64-bit integers back to Javascript, which would otherwise destroy them."""
+
+    if isSequence( obj ):
+        return [ stringify_integers(o) for o in obj ]
+    elif isinstance( obj, dict ):
+        return { str(k): stringify_integers(v) for k, v in obj.items() }
+    elif isinstance( obj, numbers.Integral ):
+        return str(obj)
+    else:
+        return obj
+
+
+# ======================================================================
+
 def parse_bool( val ):
     """Check if a variable represents a boolean value is True or False."""
     if val is None:
@@ -221,8 +272,10 @@ def asUUID( id ):
         return id
     elif isinstance( id, str ):
         return uuid.UUID( id )
+    elif isinstance( id, list ):
+        return [ x if isinstance(x, uuid.UUID) else uuid.UUID(x) for x in id ]
     else:
-        raise ValueError( f"Don't know how to turn {id} into UUID." )
+        raise ValueError( f"Don't know how to turn {id} into UUID or a list of UUIDs." )
 
 
 NULLUUID = asUUID( '00000000-0000-0000-0000-000000000000' )
@@ -238,8 +291,76 @@ def isSequence( var ):
 
     """
     return ( isinstance( var, collections.abc.Sequence )
-             and not ( isinstance( var, str ) or
-                       isinstance( var, bytes ) ) )
+             and not ( isinstance( var, (str, bytes) ) ) )
+
+
+def allAreSequences( var ):
+    """Return True if every element of var is a sequence, but not a string or bytes.
+
+    Here to reduce function calling overhead; I don't really know how
+    python is implemented well enough to know if using isSequence in a
+    list comprehension will trigger the function calling overhead for
+    each element of the list, but I suspect it does.
+
+    I *think* isinstance has less overhead.  I hope.
+
+    """
+
+    if not isinstance( var, collections.abc.Sequence ):
+        return False
+    if isinstance( var, (str, bytes) ):
+        return False
+    return all( ( isinstance( elem, collections.abc.Sequence )
+                  and not ( isinstance( elem, (str, bytes) ) ) )
+                for elem in var )
+
+
+def anyIsSequence( var ):
+    """Return True if any element of var is a sequence, but False if var itself is not a sequence.
+
+    cf: allAreSequences
+
+    """
+    if not isinstance( var, collections.abc.Sequence ):
+        return False
+    if isinstance( var, (str, bytes) ):
+        return False
+    return any( ( isinstance( elem, collections.abc.Sequence )
+                  and not ( isinstance( elem, (str, bytes) ) ) )
+                for elem in var )
+
+
+def listify( val, require_string=False ):
+    """Return a list version of val.
+
+    If val is None, return None.  If val is an iterable (but not a str
+    or bytes), return list(val).  Otherwise, return [val].
+
+    Parameters
+    ----------
+    require_string: bool (default False)
+       If true, then val must either be a sequence of strings or a string
+
+    Returns
+    -------
+    list or None
+
+    """
+
+    if val is None:
+        return val
+
+    if isinstance( val, collections.abc.Iterable ):
+        if isinstance( val, str ) or isinstance( val, bytes ):
+            return [ val ]
+        else:
+            if require_string and ( not all( [ isinstance( i, str ) for i in val ] ) ):
+                raise TypeError( 'listify: all elements of passed sequence must be strings.' )
+            return list( val )
+    else:
+        if require_string and ( not isinstance( val, str ) ):
+            raise TypeError( f'listify wants a string, not a {type(val)}' )
+        return [ val ]
 
 
 # These next few will, by design, raise an exception of d[kw] isn't empty and can't be parsed to the right thing
@@ -388,6 +509,7 @@ def pandas_to_list( values ):
 def laboriously_construct_pandas( data, columns=None, int16cols=[], int32cols=[], int64cols=[],
                                   floatcols=[], doublecols=[], boolcols=[], keyname=None, indices=None,
                                   ignore_missing_cols=False ):
+
     """Convert one of three python structures to a pandas DataFrame.
 
     Two of these structures nominally could be constrcuted by just
@@ -508,7 +630,7 @@ def laboriously_construct_pandas( data, columns=None, int16cols=[], int32cols=[]
                 if len(columns) < 3:
                     raise ValueError( "Passing a keyname with a list of dicts requires at least three "
                                       "keys in each dictionary." )
-                if any( isSequence( row[keyname] ) for row in data ):
+                if anyIsSequence( [ row[keyname] for row in data ] ):
                     raise ValueError( "If you pass a list of dicts with a keyname, then the values of "
                                       "that key in each dict must be a scalar." )
                 if not all( all( isinstance(row[col], list) for col in columns if col != keyname )
@@ -533,7 +655,7 @@ def laboriously_construct_pandas( data, columns=None, int16cols=[], int32cols=[]
             else:
                 serieses = { c: pandas.Series( ( r[c] for r in data ), dtype=dtypes[c] ) for c in columns }
 
-        elif all( isSequence( row ) for row in data ):
+        elif allAreSequences( data ):
             numcols = len( data[0] )
             if any( len(row) != numcols for row in data ):
                 raise ValueError( "List of lists, all rows must have the same length" )
@@ -575,7 +697,7 @@ def laboriously_construct_pandas( data, columns=None, int16cols=[], int32cols=[]
             serieses[keyname] = pandas.Series( itertools.chain.from_iterable( [k] * len(v[col0])
                                                                               for k, v in data.items() ) )
         else:
-            if not all( isSequence( row ) for row in data.values() ):
+            if not allAreSequences( list(data.values()) ):
                 raise TypeError( "All dictionary values must be lists" )
             columns = list( data.keys() )
             dtypes = get_dtypes( columns )
@@ -590,7 +712,7 @@ def laboriously_construct_pandas( data, columns=None, int16cols=[], int32cols=[]
             indices = list( indices )
         if keyname is not None:
             indices.insert( 0, keyname )
-        df.set_index( indices, inplace=True )
+        df = df.set_index( indices )
 
     FDBLogger.debug( "...done laboriously constructing a pandas dataframe." )
 
