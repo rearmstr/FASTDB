@@ -11,7 +11,7 @@ services:
 
   
   create-buckets:
-    image: minio/mc
+    image: netvark/mc
     depends_on:
       minio-site1:
         condition: service_started
@@ -386,7 +386,7 @@ services:
     depends_on:
       init-certs:
         condition: service_completed_successfully
-    image: minio/minio
+    image: pgsty/silo
     command: server /data --console-address ":9001" --certs-dir /certs
     ports:
       - "9000:9000"
@@ -401,7 +401,7 @@ services:
     depends_on:
       init-certs:
         condition: service_completed_successfully
-    image: minio/minio
+    image: pgsty/silo
     command: server /data --console-address ":9001" --certs-dir /certs
     ports:
       - "9010:9000"
