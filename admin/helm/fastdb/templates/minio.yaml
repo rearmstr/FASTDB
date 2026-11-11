@@ -21,7 +21,7 @@ spec:
     spec:
       containers:
         - name: minio
-          image: minio/minio
+          image: pgsty/silo
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -124,7 +124,7 @@ spec:
     spec:
       containers:
         - name: minio
-          image: minio/minio
+          image: pgsty/silo
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -221,7 +221,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: create-buckets
-          image: minio/mc
+          image: netvark/mc
           securityContext:
             capabilities:
               drop:
