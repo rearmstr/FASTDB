@@ -1,7 +1,7 @@
 """
 Integration test for WAL archiving via pgBackRest to S3-compatible object stores.
 
-Phase 2.3 deliverable: Verify that when archiving is enabled on the primary,
+Verify that when archiving is enabled on the primary,
 WAL segments are archived to both MinIO object stores after database writes.
 
 This test uses the existing snana_fits_maintables_loaded_module fixture which
