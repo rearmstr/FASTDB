@@ -29,7 +29,9 @@ def _do_nothing( *args, **kwargs ):
 def _close_kafka_consumer( obj ):
     obj.close()
 
-_orphaned_consumers = [] 
+
+_orphaned_consumers = []
+
 
 class KafkaConsumer:
     """Consume messages from a kafka server using a confluent_kafka.Consumer."""

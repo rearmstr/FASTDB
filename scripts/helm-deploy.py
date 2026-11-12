@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Deploy FASTDB to Kubernetes via Helm.
+"""Deploy FASTDB to Kubernetes via Helm.
 
 This is a Python replacement for scripts/helm-deploy.sh with a cleaner split between:
 
@@ -42,7 +41,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Iterable
+from collections.abc import Iterable
 
 
 DEFAULT_VALUES = "admin/helm/fastdb/values-local.yaml"
@@ -238,8 +237,8 @@ def build_install(container_runtime: str, external_url: str) -> None:
 set -e
 
 touch aclocal.m4 configure
-find . -name Makefile.am -exec touch {{}} \;
-find . -name Makefile.in -exec touch {{}} \;
+find . -name Makefile.am -exec touch {{}} \\;
+find . -name Makefile.in -exec touch {{}} \\;
 ./configure \
   --with-installdir=/fastdb \
   --with-smtp-server=mailhog \
@@ -414,7 +413,7 @@ def copy_runtime_tree(namespace: str, shell_pod: str, context: str | None) -> No
     run(k + ["exec", "-n", namespace, shell_pod, "--", "mkdir", "-p", "/fastdb/db"])
     tar_copy_to_pod("db", namespace, shell_pod, "/fastdb/db/", context)
     print("  db/ copied.")
-    
+
 
 def sync_db_to_kind_node(container_runtime: str, cluster_name: str) -> None:
     node = f"{cluster_name}-control-plane"
@@ -438,7 +437,8 @@ def sync_db_to_kind_node(container_runtime: str, cluster_name: str) -> None:
 
     if tar_return != 0 or copy_proc.returncode != 0:
         raise DeployError("Failed to sync db/ into Kind node /fastdb-db")
-    
+
+
 def sync_db_to_kind_hostpath(volume_root: Path) -> None:
     src = Path("db")
     dest = volume_root / "fastdb-db"
@@ -592,7 +592,7 @@ def main(argv: Iterable[str]) -> int:
     if not args.skip_certs and (args.create_cluster or args.force_certs):
         setup_kind_certs(namespace, force=args.force_certs)
         print("")
-        
+
     sync_kind_hostpaths = args.sync_kind_hostpaths or bool(args.create_cluster)
     if sync_kind_hostpaths:
         sync_db_to_kind_hostpath(kind_volume_root)

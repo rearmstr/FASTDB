@@ -1,5 +1,4 @@
-"""
-Integration test for WAL archiving via pgBackRest to S3-compatible object stores.
+"""Integration test for WAL archiving via pgBackRest to S3-compatible object stores.
 
 Verify that when archiving is enabled on the primary,
 WAL segments are archived to both MinIO object stores after database writes.

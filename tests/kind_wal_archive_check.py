@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
-"""
-Quiet WAL archive + standby replay verification for FASTDB Helm/Kind.
+"""Quiet WAL archive + standby replay verification for FASTDB Helm/Kind.
 
 Default output:
 
@@ -38,7 +37,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Callable
+from collections.abc import Callable
 
 
 @dataclass
@@ -87,8 +86,7 @@ def run_cmd(ctx: Context, cmd: list[str], *, check: bool = True) -> str:
         proc = subprocess.run(
             cmd,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             timeout=ctx.args.command_timeout,
         )
     except subprocess.TimeoutExpired as exc:
@@ -174,7 +172,8 @@ set -eu
 export HOME=/tmp
 export MC_CONFIG_DIR=/tmp/.mc
 mkdir -p /tmp/.mc
-{mc} alias set {shell_quote(alias)} {shell_quote(endpoint)} {shell_quote(ctx.args.access_key)} {shell_quote(ctx.args.secret_key)} >/dev/null
+{mc} alias set {shell_quote(alias)} {shell_quote(endpoint)} \\
+    {shell_quote(ctx.args.access_key)} {shell_quote(ctx.args.secret_key)} >/dev/null
 """
 
 

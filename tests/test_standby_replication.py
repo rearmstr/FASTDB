@@ -1,5 +1,4 @@
-"""
-Integration test for standby replication via pgBackRest WAL archiving.
+"""Integration test for standby replication via pgBackRest WAL archiving.
 
 Verify that a standby PostgreSQL instance receives
 and replays WAL from the primary, so that data written to the primary
@@ -252,7 +251,7 @@ class TestStandbyReplication:
             f"Incremental write to '{test_table}' did not replicate to standby "
             f"within {REPLICATION_TIMEOUT}s."
         )
-        print(f"\n  Incremental write replicated successfully")
+        print("\n  Incremental write replicated successfully")
 
     def test_standby_rejects_writes(self):
         """The standby must reject write operations (it's read-only)."""
