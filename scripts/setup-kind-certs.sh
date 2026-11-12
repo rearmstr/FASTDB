@@ -30,7 +30,7 @@ set -euo pipefail
 NAMESPACE="${1:-fastdb-local}"
 FORCE="${2:-}"
 
-CERT_DIR="certs"
+CERT_DIR="${CERT_DIR:-certs/kind}"
 CA_KEY="${CERT_DIR}/ca.key"
 CA_CRT="${CERT_DIR}/ca.crt"
 SERVER_KEY="${CERT_DIR}/server.key"

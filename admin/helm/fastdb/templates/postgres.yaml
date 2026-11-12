@@ -11,6 +11,9 @@ metadata:
     app: postgres
 spec:
   replicas: {{ .Values.postgres.replicas }}
+  strategy:
+    type: Recreate
+    rollingUpdate: null
   selector:
     matchLabels:
       app: postgres

@@ -27,7 +27,7 @@
 #                            Bakes the path into frontend JS/HTML during the build step.
 #   --load-images            Build container images and load them into the Kind cluster.
 #                            Implied by --create-cluster. Uses DOCKER_ARCHIVE and DOCKER_VERSION
-#                            env vars (defaults: ghcr.io/lsstdesc, test20251201).
+#                            env vars (defaults: ghcr.io/lsstdesc, test20261028a).
 #   -h, --help               Show this help message
 #
 
@@ -169,7 +169,7 @@ fi
 # ── Step 1b: Build and load images into Kind ──────────────────────────
 if [[ "$LOAD_IMAGES" == "true" ]]; then
   DOCKER_ARCHIVE="${DOCKER_ARCHIVE:-ghcr.io/lsstdesc}"
-  DOCKER_VERSION="${DOCKER_VERSION:-test20260225}"
+  DOCKER_VERSION="${DOCKER_VERSION:-test20261028a}"
 
   echo "--- Building container images ---"
   $CONTAINER_RT compose build postgres postgres-standby mongodb shell webap queryrunner

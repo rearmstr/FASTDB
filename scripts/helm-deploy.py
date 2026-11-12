@@ -14,18 +14,18 @@ Usage:
 
 Examples:
   # Local Kind bootstrap using the built-in Kind config
-  DOCKER_VERSION=test20260225 ./scripts/helm-deploy.py fastdb-local admin/helm/fastdb/values-local.yaml \
+  DOCKER_VERSION=test20261028a ./scripts/helm-deploy.py fastdb-local admin/helm/fastdb/values-local.yaml \
     --create-cluster \
     --load-images
 
   # Local Kind bootstrap using a custom Kind config
-  DOCKER_VERSION=test20260225 ./scripts/helm-deploy.py fastdb-local admin/helm/fastdb/values-local.yaml \
+  DOCKER_VERSION=test20261028a ./scripts/helm-deploy.py fastdb-local admin/helm/fastdb/values-local.yaml \
     --cluster-name fastdb-local \
     --create-cluster admin/local/kind-config.yaml \
     --load-images
 
   # Existing Kubernetes context, e.g. NERSC/SLAC
-  DOCKER_VERSION=test20260225 ./scripts/helm-deploy.py rearmstr-dev admin/helm/fastdb/values-nersc.yaml \
+  DOCKER_VERSION=test20261028a ./scripts/helm-deploy.py rearmstr-dev admin/helm/fastdb/values-nersc.yaml \
     --context <your-context>
 
 Notes:
@@ -49,7 +49,7 @@ DEFAULT_VALUES = "admin/helm/fastdb/values-local.yaml"
 DEFAULT_CHART = "admin/helm/fastdb"
 DEFAULT_RELEASE = "fastdb"
 DEFAULT_DOCKER_ARCHIVE = "ghcr.io/lsstdesc"
-DEFAULT_DOCKER_VERSION = "test20260225"
+DEFAULT_DOCKER_VERSION = "test20261028a"
 DEFAULT_KIND_VOLUME_ROOT = "kind-volumes"
 DEFAULT_KIND_CONFIG_SENTINEL = "__DEFAULT_KIND_CONFIG__"
 
@@ -310,13 +310,17 @@ def load_images_into_kind(
             Path(tar_path).unlink(missing_ok=True)
 
 
-def setup_kind_certs(namespace: str) -> None:
+def setup_kind_certs(namespace: str, force=False ) -> None:
     script = Path("scripts/setup-kind-certs.sh")
     if not script.exists():
         print("--- setup-kind-certs.sh not found; skipping cert setup ---")
         return
 
     print("--- Setting up MinIO certs ---")
+    cmd = [str(script), namespace]
+    if force:
+        cmd.append("--force")
+    run(cmd)
     run([str(script), namespace])
 
 
@@ -501,6 +505,8 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--skip-build", action="store_true", help="Skip makeinstall build step")
     parser.add_argument("--skip-helm", action="store_true", help="Skip helm upgrade/install")
     parser.add_argument("--skip-certs", action="store_true", help="Skip scripts/setup-kind-certs.sh")
+    parser.add_argument("--force-certs", action="store_true",
+                    help="Regenerate the local MinIO CA/certs even if certs/ already exists")
     parser.add_argument("--registry-password", default="", help="Registry password/token for Helm imagePullSecret")
     parser.add_argument("--external-url", default="/", help="Base path baked into frontend build")
     parser.add_argument("--docker-archive", default=os.environ.get("DOCKER_ARCHIVE", DEFAULT_DOCKER_ARCHIVE))
@@ -583,8 +589,8 @@ def main(argv: Iterable[str]) -> int:
         load_images_into_kind(container_runtime, cluster_name, args.docker_archive, args.docker_version, env)
         print("")
 
-    if not args.skip_certs and args.create_cluster:
-        setup_kind_certs(namespace)
+    if not args.skip_certs and (args.create_cluster or args.force_certs):
+        setup_kind_certs(namespace, force=args.force_certs)
         print("")
         
     sync_kind_hostpaths = args.sync_kind_hostpaths or bool(args.create_cluster)
