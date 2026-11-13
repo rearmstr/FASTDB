@@ -99,7 +99,7 @@ spec:
   {{- end }}
   resources:
     requests:
-      storage: 5Gi
+      storage: {{ .Values.minio.site1.storageSize | default "5Gi" }}
 
 ---
 #

@@ -136,11 +136,6 @@ spec:
         - name: pgbackrest-conf
           configMap:
             name: pgbackrest-conf
-        {{- if and (or .Values.postgres.pgbackrest.repo1.caFile .Values.postgres.pgbackrest.repo2.caFile) (ne .Values.postgres.pgbackrest.caSecretName "minio-certs") }}
-        - name: pgbackrest-ca
-          secret:
-            secretName: pgbackrest-ca
-        {{- end }}
         - name: dshm
           emptyDir:
             medium: Memory

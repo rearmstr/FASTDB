@@ -7,7 +7,7 @@ global:
 
   # GitHub Container Registry
   imageRegistry: "ghcr.io/rearmstr"
-  imageTag: "test20251201"
+  imageTag: "test20261028a"
   imagePullPolicy: Always
   imagePullSecrets:
     - name: ghcr-secret
@@ -58,6 +58,7 @@ postgres:
   
   pgbackrest:
     enabled: true
+    setupBackup: true
     caSecretName: pgbackrest-ca
     caMountPath: /etc/pgbackrest-ca
     repo1:
@@ -102,5 +103,9 @@ minio:
     accessKey: minioadmin
     secretKey: minioadmin
   site1:
+    storageSize: 10Gi
     serverUrl: "https://minio-site1.rearmstr-dev.development.svc.spin.nersc.org"
     browserRedirectUrl: "https://minio-site1-console.rearmstr-dev.development.svc.spin.nersc.org"
+
+minioProxy:
+  enabled: false

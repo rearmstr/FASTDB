@@ -68,6 +68,7 @@ services:
       PGBACKREST_REPO1_S3_KEY_SECRET: minioadmin
       PGBACKREST_REPO2_S3_KEY: minioadmin
       PGBACKREST_REPO2_S3_KEY_SECRET: minioadmin
+      FASTDB_REPO2_ENABLED: true
     volumes:
       - type: volume
         source: postgres_data

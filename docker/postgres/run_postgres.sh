@@ -23,18 +23,27 @@ if [ ! -f $POSTGRES_DATA_DIR/PG_VERSION ]; then
         # Wait for S3 buckets to be ready (created by create-buckets job)
         if [ "$SETUP_BACKUP" = "true" ]; then
             echo "Waiting for S3 buckets to be ready..."
+            stanza_ready=false
+
             for i in $(seq 1 60); do
-                if pgbackrest --stanza=fastdb stanza-create 2>&1; then
-                    echo "Stanza created successfully"
+                if pgbackrest --stanza=fastdb stanza-create; then
+                    stanza_ready=true
                     break
                 fi
-                echo "Stanza create failed, retry $i/60 (buckets may not exist yet)..."
+                echo "Stanza create failed, retry $i/60..."
                 sleep 5
             done
+
+            if [ "$stanza_ready" != "true" ]; then
+                echo "ERROR: Failed to initialize pgBackRest stanza" >&2
+                exit 1
+            fi
         
             # Initiate full backup
             pgbackrest --stanza=fastdb --repo=1 --type=full backup
-            pgbackrest --stanza=fastdb --repo=2 --type=full backup
+            if [ "${FASTDB_REPO2_ENABLED:-false}" = "true" ]; then
+                pgbackrest --stanza=fastdb --repo=2 --type=full backup
+            fi
         fi
         echo "Initial base backup complete"
         /usr/lib/postgresql/17/bin/pg_ctl -D $POSTGRES_DATA_DIR stop

@@ -56,6 +56,8 @@ spec:
         env:
         - name: POSTGRES_DATA_DIR
           value: /var/lib/postgresql/data/pgdata
+        - name: FASTDB_REPO2_ENABLED
+          value: {{ .Values.postgres.pgbackrest.repo2.enabled | default false | quote }}
         {{- if .Values.postgres.pgbackrest.enabled }}
         - name: FASTDB_ARCHIVE_ENABLED
           value: "true"
