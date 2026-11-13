@@ -116,6 +116,7 @@ RUN source /venv/bin/activate && \
        "psycopg>=3.3.4,<4.0.0" \
        "pycryptodome>=3.23.0,<4.0.0" \
        "pymongo>=4.17.0,<5.0.0" \
+       "minio>=7.2.0,<8.0.0" \
        "pytest==9.1.1,<10.0.0" \
        "pytest-timestamper==0.0.10" \
        "python-dateutil==2.9.0.post0" \
