@@ -9,7 +9,7 @@ global:
   # imagePullPolicy: Never means K8s uses the local store only — no registry contact.
   imageRegistry: "ghcr.io/lsstdesc"
   #imageTag: "test20260225"
-  imageTag: "test20261028a"
+  imageTag: "test20261120a"
   imagePullPolicy: Never
   imagePullSecrets: []
 

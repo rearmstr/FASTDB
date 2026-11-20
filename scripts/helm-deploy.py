@@ -13,18 +13,18 @@ Usage:
 
 Examples:
   # Local Kind bootstrap using the built-in Kind config
-  DOCKER_VERSION=test20261028a ./scripts/helm-deploy.py fastdb-local admin/helm/fastdb/values-local.yaml \
+  DOCKER_VERSION=test20261120a ./scripts/helm-deploy.py fastdb-local admin/helm/fastdb/values-local.yaml \
     --create-cluster \
     --load-images
 
   # Local Kind bootstrap using a custom Kind config
-  DOCKER_VERSION=test20261028a ./scripts/helm-deploy.py fastdb-local admin/helm/fastdb/values-local.yaml \
+  DOCKER_VERSION=test20261120a ./scripts/helm-deploy.py fastdb-local admin/helm/fastdb/values-local.yaml \
     --cluster-name fastdb-local \
     --create-cluster admin/local/kind-config.yaml \
     --load-images
 
   # Existing Kubernetes context, e.g. NERSC/SLAC
-  DOCKER_VERSION=test20261028a ./scripts/helm-deploy.py rearmstr-dev admin/helm/fastdb/values-nersc.yaml \
+  DOCKER_VERSION=test20261120a ./scripts/helm-deploy.py rearmstr-dev admin/helm/fastdb/values-nersc.yaml \
     --context <your-context>
 
 Notes:
@@ -48,7 +48,7 @@ DEFAULT_VALUES = "admin/helm/fastdb/values-local.yaml"
 DEFAULT_CHART = "admin/helm/fastdb"
 DEFAULT_RELEASE = "fastdb"
 DEFAULT_DOCKER_ARCHIVE = "ghcr.io/lsstdesc"
-DEFAULT_DOCKER_VERSION = "test20261028a"
+DEFAULT_DOCKER_VERSION = "test20261120a"
 DEFAULT_KIND_VOLUME_ROOT = "kind-volumes"
 DEFAULT_KIND_CONFIG_SENTINEL = "__DEFAULT_KIND_CONFIG__"
 

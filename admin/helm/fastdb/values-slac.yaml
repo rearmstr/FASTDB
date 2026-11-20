@@ -7,7 +7,7 @@ global:
 
   # GitHub Container Registry
   imageRegistry: "ghcr.io/rearmstr"
-  imageTag: "test20261028a"
+  imageTag: "test20261120a"
   imagePullPolicy: Always
   imagePullSecrets:
     - name: ghcr-secret
